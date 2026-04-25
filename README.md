@@ -46,7 +46,7 @@ When Decky is present, the installer resolves the newest published GitHub releas
 $HOME/homebrew/plugins/Xbox Companion
 ```
 
-Then it restarts Decky Loader when possible. Xbox Companion should appear in the Decky quick access menu after the restart.
+Then it restarts Decky Loader when possible. Xbox Companion should appear in the Decky quick access menu after the restart. The installer keeps the extracted file modes as-is and only fixes ownership on the plugin directory after copying.
 
 To install a specific published version instead of the newest one:
 
