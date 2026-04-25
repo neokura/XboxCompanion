@@ -133,6 +133,15 @@ LEGION_GO_TABLET_HID = {
     "interface": None,
     "protocol": "legion_go_tablet",
 }
+ASUS_ALLY_HID = {
+    "name": "ASUS ROG Ally HID RGB",
+    "vid": 0x0B05,
+    "pids": [0x1ABE, 0x1B4C],
+    "usage_page": 0xFF31,
+    "usage": 0x0080,
+    "interface": None,
+    "protocol": "asus_ally",
+}
 
 ATOMIC_UPDATE_DIR = "/etc/atomic-update.conf.d"
 
@@ -929,7 +938,21 @@ class Plugin:
                     return {**device, "config": config}
         return None
 
+    def _get_asus_hid_rgb_device(self) -> dict | None:
+        for device in self._legion_hid_candidates():
+            if self._hid_device_matches_config(device, ASUS_ALLY_HID):
+                return {**device, "config": ASUS_ALLY_HID}
+        return None
+
     def _get_rgb_backend(self) -> dict:
+        asus_device = self._get_asus_hid_rgb_device()
+        if asus_device:
+            return {
+                "type": "asus_hid",
+                "device": asus_device,
+                "details": asus_device["config"]["name"],
+            }
+
         led_path = self._get_rgb_led_path()
         if led_path:
             return {"type": "sysfs", "path": led_path, "details": "sysfs multicolor LED"}
@@ -990,7 +1013,12 @@ class Plugin:
 
     def _get_rgb_supported_modes(self, backend: dict) -> list[str]:
         if backend["type"] == "legion_hid":
+            protocol = backend.get("device", {}).get("config", {}).get("protocol")
+            if protocol in {"legion_go_s", "legion_go_tablet"}:
+                return ["solid", "pulse", "rainbow", "spiral"]
             return ["solid", "pulse", "rainbow"]
+        if backend["type"] == "asus_hid":
+            return ["solid", "pulse", "rainbow", "spiral"]
         if backend["type"] == "sysfs":
             return ["solid"]
         return []
@@ -1002,7 +1030,7 @@ class Plugin:
             capabilities[mode] = {
                 "color": mode in {"solid", "pulse"},
                 "brightness": True,
-                "speed": backend["type"] == "legion_hid" and mode in {"pulse", "rainbow"},
+                "speed": backend["type"] in {"legion_hid", "asus_hid"} and mode in {"pulse", "rainbow", "spiral"},
             }
         return capabilities
 
@@ -1597,6 +1625,7 @@ class Plugin:
             "solid": 0,
             "pulse": 1,
             "rainbow": 2,
+            "spiral": 3,
         }
         speed_map = {
             "low": 21,
@@ -1642,6 +1671,7 @@ class Plugin:
             "solid": 1,
             "pulse": 2,
             "rainbow": 3,
+            "spiral": 4,
         }
         speed_map = {
             "low": 42,
@@ -1679,6 +1709,87 @@ class Plugin:
         rgb = color.lstrip("#")
         return int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16)
 
+    def _rgb_hid_padded(self, payload: list[int]) -> bytes:
+        return bytes(payload) + bytes(max(0, 64 - len(payload)))
+
+    def _asus_rgb_brightness_level(self, brightness: int) -> int:
+        normalized = self._normalize_rgb_brightness(brightness)
+        if normalized <= 0:
+            return 0x00
+        if normalized <= 33:
+            return 0x01
+        if normalized <= 66:
+            return 0x02
+        return 0x03
+
+    def _asus_rgb_config_command(self, boot: bool = False, charging: bool = False) -> bytes:
+        value = 0x02
+        if boot:
+            value += 0x09
+        if charging:
+            value += 0x04
+        return self._rgb_hid_padded([0x5A, 0xD1, 0x09, 0x01, value])
+
+    def _disable_asus_dynamic_lighting(self, device: dict) -> None:
+        if device.get("product_id") != 0x1B4C:
+            return
+        module = self._hid_module()
+        if module is None or not hasattr(module, "Device"):
+            return
+        try:
+            for candidate in self._hid_module_devices():
+                if candidate.get("vendor_id") != ASUS_ALLY_HID["vid"]:
+                    continue
+                if candidate.get("product_id") != 0x1B4C:
+                    continue
+                application = ((candidate.get("usage_page") or 0) << 16) | (candidate.get("usage") or 0)
+                if application != 0x00590001:
+                    continue
+                dyn_device = module.Device(path=candidate["path"])
+                dyn_device.write(bytes([0x06, 0x01]))
+                close = getattr(dyn_device, "close", None)
+                if callable(close):
+                    close()
+                break
+        except Exception:
+            pass
+
+    def _asus_hid_rgb_commands(
+        self,
+        color: str,
+        enabled: bool,
+        brightness: int = RGB_DEFAULT_BRIGHTNESS,
+        mode: str = RGB_DEFAULT_MODE,
+        speed: str = RGB_DEFAULT_SPEED,
+    ) -> list[bytes]:
+        if not enabled:
+            return [self._rgb_hid_padded([0x5A, 0xBA, 0xC5, 0xC4, 0x00])]
+
+        r, g, b = self._hex_to_rgb(color)
+        mode_map = {
+            "solid": 0x00,
+            "pulse": 0x01,
+            "rainbow": 0x02,
+            "spiral": 0x03,
+        }
+        speed_map = {
+            "low": 0xE1,
+            "medium": 0xEB,
+            "high": 0xF5,
+        }
+        mode_value = mode_map.get(mode, 0x00)
+        speed_value = 0x00 if mode == "solid" else speed_map.get(speed, speed_map[RGB_DEFAULT_SPEED])
+        if mode == "spiral":
+            r, g, b = 0, 0, 0
+        payload = [0x5A, 0xB3, 0x00, mode_value, r, g, b, speed_value, 0x00, 0x00, 0x00, 0x00, 0x00]
+        return [
+            self._asus_rgb_config_command(),
+            self._rgb_hid_padded([0x5A, 0xBA, 0xC5, 0xC4, self._asus_rgb_brightness_level(brightness)]),
+            self._rgb_hid_padded(payload),
+            self._rgb_hid_padded([0x5A, 0xB5]),
+            self._rgb_hid_padded([0x5A, 0xB4]),
+        ]
+
     def _legion_hid_rgb_commands(
         self,
         device: dict,
@@ -1693,6 +1804,8 @@ class Plugin:
             return self._legion_go_s_rgb_commands(color, enabled, brightness, mode, speed)
         if protocol == "legion_go_tablet":
             return self._legion_go_tablet_rgb_commands(color, enabled, brightness, mode, speed)
+        if protocol == "asus_ally":
+            return self._asus_hid_rgb_commands(color, enabled, brightness, mode, speed)
         return []
 
     def _open_hid_module_device(self, path):
@@ -1710,17 +1823,18 @@ class Plugin:
             decky.logger.warning(f"Failed to open HID device: {e}")
         return None
 
-    def _write_legion_hid_rgb(
+    def _write_hid_rgb(
         self,
-        device: dict,
+        backend: dict,
         color: str,
         enabled: bool,
         brightness: int | None = None,
         mode: str | None = None,
         speed: str | None = None,
     ) -> bool:
+        device = backend["device"]
         target_brightness = self._get_saved_rgb_brightness() if brightness is None else brightness
-        target_mode = self._get_saved_rgb_mode({"type": "legion_hid"}) if mode is None else mode
+        target_mode = self._get_saved_rgb_mode(backend) if mode is None else mode
         target_speed = self._normalize_rgb_speed(
             self.settings.get("rgb_speed", RGB_DEFAULT_SPEED) if speed is None else speed
         )
@@ -1735,6 +1849,9 @@ class Plugin:
         if not commands:
             return False
 
+        if backend["type"] == "asus_hid":
+            self._disable_asus_dynamic_lighting(device)
+
         if device.get("backend") == "hidraw":
             try:
                 with open(device["path"], "wb", buffering=0) as f:
@@ -1742,7 +1859,7 @@ class Plugin:
                         f.write(command)
                 return True
             except Exception as e:
-                decky.logger.warning(f"Failed to write Legion HID raw RGB command: {e}")
+                decky.logger.warning(f"Failed to write HID raw RGB command: {e}")
                 return False
 
         hid_device = self._open_hid_module_device(device.get("path"))
@@ -1757,7 +1874,7 @@ class Plugin:
                 close()
             return True
         except Exception as e:
-            decky.logger.warning(f"Failed to write Legion HID RGB command: {e}")
+            decky.logger.warning(f"Failed to write HID RGB command: {e}")
             return False
 
     async def get_rgb_state(self) -> dict:
@@ -1792,7 +1909,7 @@ class Plugin:
             enabled, color, brightness = self._read_rgb_state_from_led(backend["path"])
             mode = self._get_saved_rgb_mode(backend)
             speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-        elif backend["type"] == "legion_hid":
+        elif backend["type"] in {"legion_hid", "asus_hid"}:
             enabled = bool(self.settings.get("rgb_enabled", False))
             color = self._normalize_rgb_color(
                 self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
@@ -1853,8 +1970,8 @@ class Plugin:
             current_brightness = self._get_saved_rgb_brightness()
             current_mode = self._get_saved_rgb_mode(backend)
             current_speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-            success = self._write_legion_hid_rgb(
-                backend["device"],
+            success = self._write_hid_rgb(
+                backend,
                 current_color,
                 enabled,
                 current_brightness,
@@ -1895,8 +2012,8 @@ class Plugin:
             brightness = self._get_saved_rgb_brightness()
             mode = self._get_saved_rgb_mode(backend)
             speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
-            success = self._write_legion_hid_rgb(
-                backend["device"],
+            success = self._write_hid_rgb(
+                backend,
                 normalized,
                 enabled,
                 brightness,
@@ -1944,8 +2061,8 @@ class Plugin:
             speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
             success = True
             if enabled:
-                success = self._write_legion_hid_rgb(
-                    backend["device"],
+                success = self._write_hid_rgb(
+                    backend,
                     current_color,
                     enabled,
                     normalized_brightness,
@@ -1981,9 +2098,9 @@ class Plugin:
         current_speed = self._normalize_rgb_speed(self.settings.get("rgb_speed", RGB_DEFAULT_SPEED))
 
         success = True
-        if backend["type"] == "legion_hid" and enabled:
-            success = self._write_legion_hid_rgb(
-                backend["device"],
+        if backend["type"] in {"legion_hid", "asus_hid"} and enabled:
+            success = self._write_hid_rgb(
+                backend,
                 current_color,
                 enabled,
                 current_brightness,
@@ -2019,9 +2136,9 @@ class Plugin:
         current_brightness = self._get_saved_rgb_brightness()
 
         success = True
-        if backend["type"] == "legion_hid" and enabled:
-            success = self._write_legion_hid_rgb(
-                backend["device"],
+        if backend["type"] in {"legion_hid", "asus_hid"} and enabled:
+            success = self._write_hid_rgb(
+                backend,
                 current_color,
                 enabled,
                 current_brightness,

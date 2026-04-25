@@ -1157,7 +1157,7 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(state["available"])
         self.assertIn("Legion Go S", state["details"])
         self.assertTrue(success)
-        self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow"])
+        self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow", "spiral"])
         self.assertEqual(FakeHidDevice.writes[0], bytes([0x04, 0x06, 0x01]))
         self.assertEqual(FakeHidDevice.writes[1], bytes([0x10, 0x02, 0x03]))
         self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x00, 0x00, 0xFF, 0x00, 0x3F, 0x2A]))
@@ -1240,6 +1240,43 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x01, 0x00, 0xFF, 0xFF, 0x3F, 0x2A]))
         self.assertEqual(FakeHidDevice.writes[-1], bytes([0x10, 0x05, 0x01, 0x00, 0xFF, 0xFF, 0x3F, 0x3F]))
 
+    def test_legion_rgb_spiral_mode_is_applied_natively(self):
+        plugin = main.Plugin()
+        plugin.settings_path = None
+        plugin.settings = {
+            "rgb_enabled": True,
+            "rgb_color": "#00FFFF",
+            "rgb_brightness": 100,
+            "rgb_mode": "solid",
+            "rgb_speed": "medium",
+        }
+        FakeHidDevice.writes = []
+        FakeHidModule.devices = [
+            {
+                "path": b"/dev/hidraw-legion-go-s",
+                "vendor_id": 0x1A86,
+                "product_id": 0xE310,
+                "usage_page": 0xFFA0,
+                "usage": 0x0001,
+                "interface_number": 3,
+            }
+        ]
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_get_rgb_led_path", return_value=""
+        ), patch.object(
+            plugin, "_hid_module", return_value=FakeHidModule
+        ), patch.object(
+            plugin, "_hidraw_devices", return_value=[]
+        ):
+            mode_success = asyncio.run(plugin.set_rgb_mode("spiral"))
+            state = asyncio.run(plugin.get_rgb_state())
+
+        self.assertTrue(mode_success)
+        self.assertEqual(state["mode"], "spiral")
+        self.assertTrue(state["speed_available"])
+        self.assertEqual(FakeHidDevice.writes[-1], bytes([0x10, 0x05, 0x03, 0x00, 0xFF, 0xFF, 0x3F, 0x2A]))
+
     def test_legion_go_tablet_hid_rgb_uses_huesync_device_ids(self):
         plugin = main.Plugin()
         plugin.settings_path = None
@@ -1276,6 +1313,46 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(success)
         self.assertEqual(FakeHidDevice.writes[0], bytes([0x05, 0x06, 0x70, 0x02, 0x03, 0x00, 0x01]))
         self.assertEqual(FakeHidDevice.writes[1], bytes([0x05, 0x06, 0x70, 0x02, 0x04, 0x00, 0x01]))
+
+    def test_asus_ally_hid_rgb_supports_native_modes(self):
+        plugin = main.Plugin()
+        plugin.settings_path = None
+        plugin.settings = {
+            "rgb_enabled": True,
+            "rgb_color": "#00FFFF",
+            "rgb_brightness": 75,
+            "rgb_mode": "solid",
+            "rgb_speed": "medium",
+        }
+        FakeHidDevice.writes = []
+        FakeHidModule.devices = [
+            {
+                "path": b"/dev/hidraw-ally",
+                "vendor_id": 0x0B05,
+                "product_id": 0x1ABE,
+                "usage_page": 0xFF31,
+                "usage": 0x0080,
+                "interface_number": 0,
+            }
+        ]
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_get_rgb_led_path", return_value=""
+        ), patch.object(
+            plugin, "_hid_module", return_value=FakeHidModule
+        ), patch.object(
+            plugin, "_hidraw_devices", return_value=[]
+        ):
+            state = asyncio.run(plugin.get_rgb_state())
+            success = asyncio.run(plugin.set_rgb_mode("spiral"))
+
+        self.assertTrue(state["available"])
+        self.assertIn("ASUS ROG Ally", state["details"])
+        self.assertEqual(state["supported_modes"], ["solid", "pulse", "rainbow", "spiral"])
+        self.assertTrue(success)
+        self.assertEqual(FakeHidDevice.writes[0][:5], bytes([0x5A, 0xD1, 0x09, 0x01, 0x02]))
+        self.assertEqual(FakeHidDevice.writes[1][:5], bytes([0x5A, 0xBA, 0xC5, 0xC4, 0x03]))
+        self.assertEqual(FakeHidDevice.writes[2][:8], bytes([0x5A, 0xB3, 0x00, 0x03, 0x00, 0x00, 0x00, 0xEB]))
 
     def test_rgb_state_is_exposed_in_dashboard(self):
         plugin = main.Plugin()

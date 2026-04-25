@@ -37,6 +37,7 @@ const RGB_MODE_LABELS: Record<string, string> = {
   solid: "Solid",
   pulse: "Pulse",
   rainbow: "Rainbow",
+  spiral: "Spiral",
 };
 const RGB_SPEED_LABELS: Record<string, string> = {
   low: "Low",
@@ -1335,8 +1336,8 @@ const RGBView: VFC<{
               <div style={cardStyle}>
                 <div style={viewTitleStyle}>Mode</div>
                 <div style={subtextStyle}>
-                  Native RGB modes only. Legion HID gets hardware `pulse` and `rainbow`; sysfs
-                  stays on clean `solid`.
+                  Native RGB modes where hardware exposes them. Legion HID and ASUS HID can use
+                  `pulse`, `rainbow`, and `spiral`; sysfs stays on clean `solid`.
                 </div>
                 <div style={optionGridStyle}>
                   {supportedModes.map((mode) => {
@@ -1376,7 +1377,9 @@ const RGBView: VFC<{
                               ? "Static color"
                               : mode === "pulse"
                                 ? "Native breathing effect"
-                                : "Native cycling effect"}
+                                : mode === "spiral"
+                                  ? "Native rotating effect"
+                                  : "Native cycling effect"}
                           </div>
                         </div>
                       </ButtonItem>
