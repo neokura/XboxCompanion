@@ -8,7 +8,7 @@ Xbox Companion is an alpha Decky Loader plugin for ASUS and Lenovo handhelds run
 
 The goal is simple: install it, open Decky, and see controls that reflect the real state of the handheld. No default profile is applied on first launch, no hidden preset is pushed silently, and unsupported features stay disabled instead of pretending they work.
 
-Current alpha: `0.2.0-alpha.0`
+Current alpha: `0.2.0-alpha.1`
 
 ## What It Does
 
@@ -177,7 +177,7 @@ The workflow:
 - packages a Decky-ready release zip with a top-level `xbox-companion/` directory
 - uploads the zip as a workflow artifact
 - attaches the zip to a GitHub Release when a `v*` tag is pushed
-- marks tagged pre-release versions such as `v0.2.0-alpha.0` as GitHub pre-releases
+- marks tagged pre-release versions such as `v0.2.0-alpha.1` as GitHub pre-releases
 
 The release package contains:
 
@@ -192,8 +192,8 @@ The release package contains:
 To publish a tagged alpha:
 
 ```bash
-git tag v0.2.0-alpha.0
-git push origin v0.2.0-alpha.0
+git tag v0.2.0-alpha.1
+git push origin v0.2.0-alpha.1
 ```
 
 ## Thanks
