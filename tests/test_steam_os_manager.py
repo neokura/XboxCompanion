@@ -805,6 +805,33 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertEqual(state["color"], "#00B7FF")
         self.assertTrue(success)
         self.assertEqual(values, "0 255 0")
+        self.assertEqual(state["brightness"], 100)
+
+    def test_rgb_accepts_freeform_hex_color_on_sysfs_backend(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            led = os.path.join(tmpdir, "ally:rgb:joystick_rings")
+            os.makedirs(led)
+            with open(os.path.join(led, "brightness"), "w") as f:
+                f.write("255")
+            with open(os.path.join(led, "multi_intensity"), "w") as f:
+                f.write("47103 47103 47103 47103")
+
+            plugin = main.Plugin()
+
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+                "main.ALLY_LED_PATH", led
+            ), patch(
+                "main.RGB_LED_PATH_GLOBS", []
+            ):
+                success = asyncio.run(plugin.set_rgb_color("#123ABC"))
+                state = asyncio.run(plugin.get_rgb_state())
+
+            with open(os.path.join(led, "multi_intensity"), "r") as f:
+                values = f.read()
+
+        self.assertTrue(success)
+        self.assertEqual(values, "1194684 1194684 1194684 1194684")
+        self.assertEqual(state["color"], "#123ABC")
 
     def test_rgb_legacy_packed_led_format_still_works_for_ally(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -865,6 +892,41 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertEqual(FakeHidDevice.writes[0], bytes([0x04, 0x06, 0x01]))
         self.assertEqual(FakeHidDevice.writes[1], bytes([0x10, 0x02, 0x03]))
         self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x00, 0x00, 0xFF, 0x00, 0x3F, 0x3F]))
+
+    def test_legion_rgb_brightness_is_scaled_and_persisted(self):
+        plugin = main.Plugin()
+        plugin.settings_path = None
+        plugin.settings = {
+            "rgb_enabled": True,
+            "rgb_color": "#00FFFF",
+            "rgb_brightness": 100,
+        }
+        FakeHidDevice.writes = []
+        FakeHidModule.devices = [
+            {
+                "path": b"/dev/hidraw-legion-go-s",
+                "vendor_id": 0x1A86,
+                "product_id": 0xE310,
+                "usage_page": 0xFFA0,
+                "usage": 0x0001,
+                "interface_number": 3,
+            }
+        ]
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_get_rgb_led_path", return_value=""
+        ), patch.object(
+            plugin, "_hid_module", return_value=FakeHidModule
+        ), patch.object(
+            plugin, "_hidraw_devices", return_value=[]
+        ):
+            success = asyncio.run(plugin.set_rgb_brightness(50))
+            state = asyncio.run(plugin.get_rgb_state())
+
+        self.assertTrue(success)
+        self.assertEqual(plugin.settings["rgb_brightness"], 50)
+        self.assertEqual(state["brightness"], 50)
+        self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x00, 0x00, 0xFF, 0xFF, 0x20, 0x3F]))
 
     def test_legion_go_tablet_hid_rgb_uses_huesync_device_ids(self):
         plugin = main.Plugin()
@@ -933,6 +995,9 @@ eDP-1 connected primary 1920x1080+0+0
                 "available": True,
                 "enabled": True,
                 "color": "#00FFFF",
+                "brightness": 75,
+                "brightness_available": True,
+                "supports_free_color": True,
                 "presets": main.RGB_COLOR_PRESETS,
                 "details": "rgb",
             },
@@ -941,6 +1006,7 @@ eDP-1 connected primary 1920x1080+0+0
 
         self.assertTrue(state["rgb"]["available"])
         self.assertEqual(state["rgb"]["color"], "#00FFFF")
+        self.assertEqual(state["rgb"]["brightness"], 75)
 
 
 class OptimizationStateTest(unittest.TestCase):

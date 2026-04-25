@@ -113,6 +113,9 @@ RGB_COLOR_PRESETS = [
     "#FFFFFF",
     "#0000FF",
 ]
+RGB_DEFAULT_BRIGHTNESS = 100
+LEGION_RGB_BRIGHTNESS_MAX = 63
+LEGION_RGB_SPEED_DEFAULT = 63
 DEFAULT_COMMAND_TIMEOUT = 5
 SYSTEM_COMMAND_ENV_DROP_KEYS = {
     "LD_LIBRARY_PATH",
@@ -858,6 +861,58 @@ class Plugin:
             and os.path.exists(os.path.join(led_path, "multi_intensity"))
         )
 
+    def _clamp_int(self, value, minimum: int, maximum: int) -> int:
+        try:
+            numeric = int(round(float(value)))
+        except Exception:
+            numeric = minimum
+        return max(minimum, min(maximum, numeric))
+
+    def _normalize_rgb_brightness(self, brightness) -> int:
+        return self._clamp_int(brightness, 0, 100)
+
+    def _normalize_rgb_color(self, color: str) -> str | None:
+        if not isinstance(color, str):
+            return None
+
+        normalized = color.strip().upper()
+        if normalized.startswith("#"):
+            normalized = normalized[1:]
+
+        if len(normalized) != 6:
+            return None
+
+        if any(char not in "0123456789ABCDEF" for char in normalized):
+            return None
+
+        return f"#{normalized}"
+
+    def _get_saved_rgb_brightness(self) -> int:
+        return self._normalize_rgb_brightness(
+            self.settings.get("rgb_brightness", RGB_DEFAULT_BRIGHTNESS)
+        )
+
+    def _scale_rgb_brightness_to_raw(self, brightness: int, maximum: int) -> int:
+        if maximum <= 0:
+            return 0
+        brightness = self._normalize_rgb_brightness(brightness)
+        return int(round((brightness / 100) * maximum))
+
+    def _scale_rgb_brightness_from_raw(self, raw_value: int, maximum: int) -> int:
+        if maximum <= 0:
+            return RGB_DEFAULT_BRIGHTNESS
+        return self._clamp_int((raw_value / maximum) * 100, 0, 100)
+
+    def _get_led_max_brightness(self, led_path: str) -> int:
+        max_brightness_path = os.path.join(led_path, "max_brightness")
+        try:
+            if os.path.exists(max_brightness_path):
+                with open(max_brightness_path, "r") as f:
+                    return max(1, int(f.read().strip() or "255"))
+        except Exception:
+            pass
+        return 255
+
     def _get_battery_path(self) -> str:
         direct_paths = [BATTERY_PATH]
         for path in direct_paths:
@@ -1280,12 +1335,16 @@ class Plugin:
         
         return battery
 
-    def _set_led_color(self, led_path: str, color: str, enabled: bool) -> bool:
+    def _set_led_color(self, led_path: str, color: str, enabled: bool, brightness: int | None = None) -> bool:
         try:
             brightness_path = os.path.join(led_path, "brightness")
             multi_intensity_path = os.path.join(led_path, "multi_intensity")
             if not os.path.exists(brightness_path) or not os.path.exists(multi_intensity_path):
                 return False
+
+            max_brightness = self._get_led_max_brightness(led_path)
+            target_brightness = self._get_saved_rgb_brightness() if brightness is None else brightness
+            raw_brightness = self._scale_rgb_brightness_to_raw(target_brightness, max_brightness)
 
             if not enabled:
                 with open(brightness_path, "w") as f:
@@ -1304,7 +1363,7 @@ class Plugin:
             with open(multi_intensity_path, "w") as f:
                 f.write(" ".join(str(value) for value in values))
             with open(brightness_path, "w") as f:
-                f.write("255")
+                f.write(str(raw_brightness))
             return True
         except Exception as e:
             decky.logger.warning(f"Failed to apply RGB state: {e}")
@@ -1353,15 +1412,22 @@ class Plugin:
 
         return [r, g, b]
 
-    def _read_rgb_state_from_led(self, led_path: str) -> tuple[bool, str]:
+    def _read_rgb_state_from_led(self, led_path: str) -> tuple[bool, str, int]:
         enabled = False
         color = RGB_COLOR_PRESETS[0]
+        brightness = self._get_saved_rgb_brightness()
 
         try:
             brightness_path = os.path.join(led_path, "brightness")
             if os.path.exists(brightness_path):
                 with open(brightness_path, "r") as f:
-                    enabled = int(f.read().strip() or "0") > 0
+                    raw_brightness = int(f.read().strip() or "0")
+                    enabled = raw_brightness > 0
+                    if enabled:
+                        brightness = self._scale_rgb_brightness_from_raw(
+                            raw_brightness,
+                            self._get_led_max_brightness(led_path),
+                        )
         except Exception:
             enabled = False
 
@@ -1391,23 +1457,35 @@ class Plugin:
         except Exception:
             color = RGB_COLOR_PRESETS[0]
 
-        return enabled, color
+        return enabled, color, brightness
 
-    def _legion_go_s_rgb_commands(self, color: str, enabled: bool) -> list[bytes]:
+    def _legion_go_s_rgb_commands(
+        self,
+        color: str,
+        enabled: bool,
+        brightness: int = RGB_DEFAULT_BRIGHTNESS,
+    ) -> list[bytes]:
         if not enabled:
             return [bytes([0x04, 0x06, 0x00])]
 
         r, g, b = self._hex_to_rgb(color)
         profile = 3
-        brightness = 63
-        speed = 63
+        raw_brightness = self._scale_rgb_brightness_to_raw(
+            brightness,
+            LEGION_RGB_BRIGHTNESS_MAX,
+        )
         return [
             bytes([0x04, 0x06, 0x01]),
             bytes([0x10, 0x02, profile]),
-            bytes([0x10, profile + 2, 0x00, r, g, b, brightness, speed]),
+            bytes([0x10, profile + 2, 0x00, r, g, b, raw_brightness, LEGION_RGB_SPEED_DEFAULT]),
         ]
 
-    def _legion_go_tablet_rgb_commands(self, color: str, enabled: bool) -> list[bytes]:
+    def _legion_go_tablet_rgb_commands(
+        self,
+        color: str,
+        enabled: bool,
+        brightness: int = RGB_DEFAULT_BRIGHTNESS,
+    ) -> list[bytes]:
         def enable_command(controller: int, value: bool) -> bytes:
             return bytes([0x05, 0x06, 0x70, 0x02, controller, 0x01 if value else 0x00, 0x01])
 
@@ -1416,11 +1494,14 @@ class Plugin:
 
         r, g, b = self._hex_to_rgb(color)
         profile = 3
-        brightness = 63
+        raw_brightness = self._scale_rgb_brightness_to_raw(
+            brightness,
+            LEGION_RGB_BRIGHTNESS_MAX,
+        )
         period = 0
         commands = []
         for controller in (0x03, 0x04):
-            commands.append(bytes([0x05, 0x0C, 0x72, 0x01, controller, 0x01, r, g, b, brightness, period, profile, 0x01]))
+            commands.append(bytes([0x05, 0x0C, 0x72, 0x01, controller, 0x01, r, g, b, raw_brightness, period, profile, 0x01]))
         for controller in (0x03, 0x04):
             commands.append(bytes([0x05, 0x06, 0x73, 0x02, controller, profile, 0x01]))
         commands.extend([enable_command(0x03, True), enable_command(0x04, True)])
@@ -1430,12 +1511,18 @@ class Plugin:
         rgb = color.lstrip("#")
         return int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16)
 
-    def _legion_hid_rgb_commands(self, device: dict, color: str, enabled: bool) -> list[bytes]:
+    def _legion_hid_rgb_commands(
+        self,
+        device: dict,
+        color: str,
+        enabled: bool,
+        brightness: int = RGB_DEFAULT_BRIGHTNESS,
+    ) -> list[bytes]:
         protocol = device["config"]["protocol"]
         if protocol == "legion_go_s":
-            return self._legion_go_s_rgb_commands(color, enabled)
+            return self._legion_go_s_rgb_commands(color, enabled, brightness)
         if protocol == "legion_go_tablet":
-            return self._legion_go_tablet_rgb_commands(color, enabled)
+            return self._legion_go_tablet_rgb_commands(color, enabled, brightness)
         return []
 
     def _open_hid_module_device(self, path):
@@ -1453,8 +1540,15 @@ class Plugin:
             decky.logger.warning(f"Failed to open HID device: {e}")
         return None
 
-    def _write_legion_hid_rgb(self, device: dict, color: str, enabled: bool) -> bool:
-        commands = self._legion_hid_rgb_commands(device, color, enabled)
+    def _write_legion_hid_rgb(
+        self,
+        device: dict,
+        color: str,
+        enabled: bool,
+        brightness: int | None = None,
+    ) -> bool:
+        target_brightness = self._get_saved_rgb_brightness() if brightness is None else brightness
+        commands = self._legion_hid_rgb_commands(device, color, enabled, target_brightness)
         if not commands:
             return False
 
@@ -1490,23 +1584,32 @@ class Plugin:
                 "available": False,
                 "enabled": False,
                 "color": RGB_COLOR_PRESETS[0],
+                "brightness": RGB_DEFAULT_BRIGHTNESS,
+                "brightness_available": False,
+                "supports_free_color": False,
                 "presets": RGB_COLOR_PRESETS,
                 "details": support.get("reason", "Platform is not supported"),
             }
 
         backend = self._get_rgb_backend()
         if backend["type"] == "sysfs":
-            enabled, color = self._read_rgb_state_from_led(backend["path"])
+            enabled, color, brightness = self._read_rgb_state_from_led(backend["path"])
         elif backend["type"] == "legion_hid":
             enabled = bool(self.settings.get("rgb_enabled", False))
-            color = self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+            color = self._normalize_rgb_color(
+                self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+            ) or RGB_COLOR_PRESETS[0]
+            brightness = self._get_saved_rgb_brightness()
         else:
-            enabled, color = False, RGB_COLOR_PRESETS[0]
+            enabled, color, brightness = False, RGB_COLOR_PRESETS[0], RGB_DEFAULT_BRIGHTNESS
 
         return {
             "available": backend["type"] != "none",
             "enabled": enabled,
             "color": color,
+            "brightness": brightness,
+            "brightness_available": backend["type"] != "none",
+            "supports_free_color": backend["type"] != "none",
             "presets": RGB_COLOR_PRESETS,
             "details": backend["details"],
         }
@@ -1523,17 +1626,31 @@ class Plugin:
             return False
 
         if backend["type"] == "sysfs":
-            _current_enabled, current_color = self._read_rgb_state_from_led(backend["path"])
-            success = self._set_led_color(backend["path"], current_color, enabled)
+            _current_enabled, current_color, current_brightness = self._read_rgb_state_from_led(backend["path"])
+            success = self._set_led_color(
+                backend["path"],
+                current_color,
+                enabled,
+                current_brightness,
+            )
         else:
-            current_color = self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
-            success = self._write_legion_hid_rgb(backend["device"], current_color, enabled)
+            current_color = self._normalize_rgb_color(
+                self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+            ) or RGB_COLOR_PRESETS[0]
+            current_brightness = self._get_saved_rgb_brightness()
+            success = self._write_legion_hid_rgb(
+                backend["device"],
+                current_color,
+                enabled,
+                current_brightness,
+            )
 
         if not success:
             return False
 
         self.settings["rgb_enabled"] = enabled
         self.settings["rgb_color"] = current_color
+        self.settings["rgb_brightness"] = current_brightness
         self._save_settings()
         return True
 
@@ -1548,22 +1665,73 @@ class Plugin:
             decky.logger.warning("RGB control not available")
             return False
 
-        normalized = color.upper()
-        if normalized not in RGB_COLOR_PRESETS:
-            decky.logger.warning(f"Unsupported RGB color preset: {color}")
+        normalized = self._normalize_rgb_color(color)
+        if normalized is None:
+            decky.logger.warning(f"Unsupported RGB color value: {color}")
             return False
 
         if backend["type"] == "sysfs":
-            enabled, _current_color = self._read_rgb_state_from_led(backend["path"])
-            success = self._set_led_color(backend["path"], normalized, enabled)
+            enabled, _current_color, brightness = self._read_rgb_state_from_led(backend["path"])
+            success = self._set_led_color(backend["path"], normalized, enabled, brightness)
         else:
             enabled = bool(self.settings.get("rgb_enabled", False))
-            success = self._write_legion_hid_rgb(backend["device"], normalized, enabled)
+            brightness = self._get_saved_rgb_brightness()
+            success = self._write_legion_hid_rgb(
+                backend["device"],
+                normalized,
+                enabled,
+                brightness,
+            )
 
         if not success:
             return False
 
         self.settings["rgb_color"] = normalized
+        self.settings["rgb_brightness"] = brightness
+        self._save_settings()
+        return True
+
+    async def set_rgb_brightness(self, brightness: int) -> bool:
+        support = self._get_current_platform_support()
+        if not support.get("supported", False):
+            decky.logger.warning(support.get("reason", "Platform is not supported"))
+            return False
+
+        backend = self._get_rgb_backend()
+        if backend["type"] == "none":
+            decky.logger.warning("RGB control not available")
+            return False
+
+        normalized_brightness = self._normalize_rgb_brightness(brightness)
+
+        if backend["type"] == "sysfs":
+            enabled, current_color, _current_brightness = self._read_rgb_state_from_led(backend["path"])
+            success = True
+            if enabled:
+                success = self._set_led_color(
+                    backend["path"],
+                    current_color,
+                    enabled,
+                    normalized_brightness,
+                )
+        else:
+            enabled = bool(self.settings.get("rgb_enabled", False))
+            current_color = self._normalize_rgb_color(
+                self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+            ) or RGB_COLOR_PRESETS[0]
+            success = True
+            if enabled:
+                success = self._write_legion_hid_rgb(
+                    backend["device"],
+                    current_color,
+                    enabled,
+                    normalized_brightness,
+                )
+
+        if not success:
+            return False
+
+        self.settings["rgb_brightness"] = normalized_brightness
         self._save_settings()
         return True
 

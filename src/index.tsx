@@ -34,6 +34,76 @@ const RGB_PRESET_LABELS: Record<string, string> = {
   "#0000FF": "Blue",
 };
 
+const clamp = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, value));
+
+const normalizeHexColor = (color: string): string => {
+  const trimmed = color.trim().toUpperCase().replace(/^#/, "");
+  return /^[0-9A-F]{6}$/.test(trimmed) ? `#${trimmed}` : RGB_PRESETS[0];
+};
+
+const hueToHex = (hue: number): string => {
+  const normalizedHue = ((hue % 360) + 360) % 360;
+  const c = 1;
+  const x = c * (1 - Math.abs(((normalizedHue / 60) % 2) - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+
+  if (normalizedHue < 60) {
+    r = c;
+    g = x;
+  } else if (normalizedHue < 120) {
+    r = x;
+    g = c;
+  } else if (normalizedHue < 180) {
+    g = c;
+    b = x;
+  } else if (normalizedHue < 240) {
+    g = x;
+    b = c;
+  } else if (normalizedHue < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+
+  const toHex = (channel: number) =>
+    Math.round(channel * 255)
+      .toString(16)
+      .padStart(2, "0")
+      .toUpperCase();
+
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+};
+
+const hexToHue = (color: string): number => {
+  const normalized = normalizeHexColor(color).replace("#", "");
+  const r = parseInt(normalized.slice(0, 2), 16) / 255;
+  const g = parseInt(normalized.slice(2, 4), 16) / 255;
+  const b = parseInt(normalized.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+
+  if (delta === 0) {
+    return 0;
+  }
+
+  let hue = 0;
+  if (max === r) {
+    hue = 60 * (((g - b) / delta) % 6);
+  } else if (max === g) {
+    hue = 60 * ((b - r) / delta + 2);
+  } else {
+    hue = 60 * ((r - g) / delta + 4);
+  }
+
+  return Math.round((hue + 360) % 360);
+};
+
 const getDashboardState = callable<[], DashboardState>("get_dashboard_state");
 const getOptimizationStates = callable<[], OptimizationData>(
   "get_optimization_states"
@@ -52,6 +122,7 @@ const setCpuBoostEnabled = callable<[boolean], boolean>("set_cpu_boost_enabled")
 const setSmtEnabled = callable<[boolean], boolean>("set_smt_enabled");
 const setRgbEnabled = callable<[boolean], boolean>("set_rgb_enabled");
 const setRgbColor = callable<[string], boolean>("set_rgb_color");
+const setRgbBrightness = callable<[number], boolean>("set_rgb_brightness");
 const setDisplaySyncSetting = callable<[string, boolean], boolean>(
   "set_display_sync_setting"
 );
@@ -80,6 +151,9 @@ interface RgbState {
   available: boolean;
   enabled: boolean;
   color: string;
+  brightness: number;
+  brightness_available: boolean;
+  supports_free_color: boolean;
   presets: string[];
   details: string;
 }
@@ -303,6 +377,16 @@ const rgbPresetRailStyle = (colors: string[]): React.CSSProperties => ({
   border: "1px solid rgba(148, 163, 184, 0.28)",
   marginTop: "-8px",
 });
+
+const rgbHueRailStyle: React.CSSProperties = {
+  width: "100%",
+  height: "10px",
+  borderRadius: "999px",
+  background:
+    "linear-gradient(90deg, #FF0000, #FFFF00, #00FF00, #00FFFF, #0000FF, #FF00FF, #FF0000)",
+  border: "1px solid rgba(148, 163, 184, 0.28)",
+  marginTop: "-8px",
+};
 
 const rgbQuickSwatchButtonStyle = (
   active: boolean,
@@ -958,16 +1042,22 @@ const RGBView: VFC<{
   const controlsDisabled = busyKey !== null || actionBusy !== null;
   const rgb = data?.rgb;
   const rgbPresets = rgb?.presets?.length ? rgb.presets : RGB_PRESETS;
-  const normalizedPresetColor = rgbPresets.includes(rgb?.color ?? "")
-    ? rgb?.color ?? rgbPresets[0]
-    : rgbPresets[0];
-  const normalizedPresetIndex = Math.max(0, rgbPresets.indexOf(normalizedPresetColor));
-  const [presetIndex, setPresetIndex] = useState<number>(normalizedPresetIndex);
-  const activeColor = rgbPresets[presetIndex] ?? normalizedPresetColor;
+  const normalizedColor = normalizeHexColor(rgb?.color ?? rgbPresets[0]);
+  const [selectedColor, setSelectedColor] = useState<string>(normalizedColor);
+  const [hueValue, setHueValue] = useState<number>(hexToHue(normalizedColor));
+  const [brightnessValue, setBrightnessValue] = useState<number>(
+    clamp(rgb?.brightness ?? 100, 0, 100)
+  );
+  const activeColor = selectedColor;
 
   useEffect(() => {
-    setPresetIndex(normalizedPresetIndex);
-  }, [normalizedPresetIndex]);
+    setSelectedColor(normalizedColor);
+    setHueValue(hexToHue(normalizedColor));
+  }, [normalizedColor]);
+
+  useEffect(() => {
+    setBrightnessValue(clamp(rgb?.brightness ?? 100, 0, 100));
+  }, [rgb?.brightness]);
 
   const runAction = async (
     actionKey: string,
@@ -1003,11 +1093,22 @@ const RGBView: VFC<{
   };
 
   const handleRgbColor = async (color: string) => {
+    const normalized = normalizeHexColor(color);
     await runAction(
-      `rgb:${color}`,
-      () => setRgbColor(color),
-      `RGB color: ${RGB_PRESET_LABELS[color] || color}`,
+      `rgb:${normalized}`,
+      () => setRgbColor(normalized),
+      `RGB color: ${RGB_PRESET_LABELS[normalized] || normalized}`,
       "Could not change the RGB color"
+    );
+  };
+
+  const handleRgbBrightness = async (brightness: number) => {
+    const normalized = clamp(brightness, 0, 100);
+    await runAction(
+      `rgb-brightness:${normalized}`,
+      () => setRgbBrightness(normalized),
+      `RGB brightness: ${normalized}%`,
+      "Could not change RGB brightness"
     );
   };
 
@@ -1070,6 +1171,9 @@ const RGBView: VFC<{
                       }}
                     >
                       {RGB_PRESET_LABELS[activeColor] || activeColor}
+                      <div style={{ marginTop: "4px", fontSize: "11px", fontWeight: 600 }}>
+                        {brightnessValue}%
+                      </div>
                     </div>
                   </div>
 
@@ -1109,36 +1213,81 @@ const RGBView: VFC<{
 
             <PanelSectionRow>
               <SliderField
-                label={`Color: ${RGB_PRESET_LABELS[activeColor] || activeColor}`}
+                label={`Hue: ${RGB_PRESET_LABELS[activeColor] || activeColor}`}
                 description={
-                  rgb.available
+                  rgb.supports_free_color
                     ? rgb.enabled
-                      ? "Horizontal preset selector"
+                      ? "Free color selection across the full spectrum"
                       : "Choose the next color before enabling RGB"
                     : rgb.details
                 }
-                value={presetIndex}
+                value={hueValue}
                 min={0}
-                max={Math.max(0, rgbPresets.length - 1)}
-                step={1}
-                disabled={!rgb.available || controlsDisabled}
+                max={360}
+                step={5}
+                disabled={!rgb.supports_free_color || controlsDisabled}
                 showValue={false}
-                notchCount={rgbPresets.length}
+                notchCount={7}
                 notchTicksVisible
-                validValues="steps"
-                notchLabels={rgbPresets.map((_color, notchIndex) => ({
+                validValues="range"
+                notchLabels={[
+                  "Red",
+                  "Yellow",
+                  "Green",
+                  "Cyan",
+                  "Blue",
+                  "Magenta",
+                  "Red",
+                ].map((label, notchIndex) => ({
                   notchIndex,
-                  label: "",
-                  value: notchIndex,
+                  label,
+                  value: notchIndex * 60,
                 }))}
                 onChange={(value: number) => {
-                  const nextIndex = Math.max(0, Math.min(rgbPresets.length - 1, value));
-                  const nextColor = rgbPresets[nextIndex];
-                  if (!nextColor || nextIndex === presetIndex) {
+                  const normalizedHue = clamp(value, 0, 360);
+                  const nextColor = hueToHex(normalizedHue);
+                  if (nextColor === activeColor) {
                     return;
                   }
-                  setPresetIndex(nextIndex);
+                  setHueValue(normalizedHue);
+                  setSelectedColor(nextColor);
                   void handleRgbColor(nextColor);
+                }}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <div style={rgbHueRailStyle} />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <SliderField
+                label={`Brightness: ${brightnessValue}%`}
+                description={
+                  rgb.brightness_available
+                    ? "Shared intensity model normalized to 0-100 across supported devices"
+                    : rgb.details
+                }
+                value={brightnessValue}
+                min={0}
+                max={100}
+                step={5}
+                disabled={!rgb.brightness_available || controlsDisabled}
+                showValue={false}
+                notchCount={6}
+                notchTicksVisible
+                validValues="range"
+                notchLabels={[0, 20, 40, 60, 80, 100].map((value, notchIndex) => ({
+                  notchIndex,
+                  label: `${value}`,
+                  value,
+                }))}
+                onChange={(value: number) => {
+                  const normalizedBrightness = clamp(value, 0, 100);
+                  if (normalizedBrightness === brightnessValue) {
+                    return;
+                  }
+                  setBrightnessValue(normalizedBrightness);
+                  void handleRgbBrightness(normalizedBrightness);
                 }}
               />
             </PanelSectionRow>
@@ -1147,8 +1296,8 @@ const RGBView: VFC<{
               <div style={cardStyle}>
                 <div style={viewTitleStyle}>Palette</div>
                 <div style={subtextStyle}>
-                  A cleaner preset flow inspired by Ally Center, adapted to the RGB backend
-                  this plugin actually exposes.
+                  Quick colors for the common looks, with free hue selection above for everything
+                  else.
                 </div>
                 <div style={rgbPresetRailStyle(rgbPresets)} />
                 <div style={rgbQuickSwatchGridStyle}>
@@ -1164,7 +1313,8 @@ const RGBView: VFC<{
                           opacity: !rgb.available || controlsDisabled ? 0.45 : 1,
                         }}
                         onClick={() => {
-                          setPresetIndex(rgbPresets.indexOf(color));
+                          setSelectedColor(color);
+                          setHueValue(hexToHue(color));
                           void handleRgbColor(color);
                         }}
                       >
