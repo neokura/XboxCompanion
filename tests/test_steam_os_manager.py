@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,28 @@ class FakeLogger:
 
     def error(self, *_args, **_kwargs):
         pass
+
+
+class FakeHidDevice:
+    writes = []
+
+    def __init__(self, path=None):
+        self.path = path
+
+    def write(self, command):
+        self.writes.append(bytes(command))
+
+    def close(self):
+        pass
+
+
+class FakeHidModule:
+    devices = []
+    Device = FakeHidDevice
+
+    @classmethod
+    def enumerate(cls):
+        return cls.devices
 
 
 fake_decky = types.SimpleNamespace(
@@ -289,6 +312,38 @@ class PluginPerformanceProfileTest(unittest.TestCase):
         self.assertTrue(asus["supported"])
         self.assertEqual(asus["support_level"], "supported")
         self.assertTrue(lenovo_future["supported"])
+
+    def test_platform_support_allows_common_lenovo_legion_identifiers(self):
+        plugin = main.Plugin()
+        support = plugin._get_platform_support(
+            "LNVNB161216",
+            "83E1",
+            "LENOVO",
+            "Legion Go",
+            {
+                "ID": "steamos",
+                "VERSION_ID": "3.8.0",
+                "PRETTY_NAME": "SteamOS 3.8",
+            },
+        )
+
+        self.assertTrue(support["supported"])
+
+    def test_platform_support_allows_common_asus_ally_identifiers(self):
+        plugin = main.Plugin()
+        support = plugin._get_platform_support(
+            "RC71L",
+            "ROG Ally",
+            "ASUSTeK COMPUTER INC.",
+            "",
+            {
+                "ID": "steamos",
+                "VERSION_ID": "3.8.0",
+                "PRETTY_NAME": "SteamOS 3.8",
+            },
+        )
+
+        self.assertTrue(support["supported"])
 
     def test_platform_support_blocks_steam_deck(self):
         plugin = main.Plugin()
@@ -608,6 +663,204 @@ eDP-1 connected primary 1920x1080+0+0
         self.assertTrue(state["enabled"])
         self.assertEqual(state["limit"], 80)
 
+    def test_cpu_settings_report_boost_disabled_when_control_is_unavailable(self):
+        plugin = main.Plugin()
+        original_exists = os.path.exists
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "get_smt_state",
+            return_value={"available": False, "enabled": False, "status": "missing", "details": "missing"},
+        ), patch(
+            "main.os.path.exists",
+            side_effect=lambda path: False if path == main.CPU_BOOST_PATH else original_exists(path),
+        ):
+            state = asyncio.run(plugin.get_cpu_settings())
+
+        self.assertFalse(state["boost_available"])
+        self.assertFalse(state["boost_enabled"])
+
+    def test_battery_info_discovers_lenovo_style_battery_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            power_supply = os.path.join(tmpdir, "power_supply")
+            bat1 = os.path.join(power_supply, "BAT1")
+            os.makedirs(bat1)
+            files = {
+                "type": "Battery",
+                "status": "Discharging",
+                "capacity": "73",
+                "cycle_count": "42",
+                "voltage_now": "15400000",
+                "current_now": "1800000",
+                "energy_full_design": "49000000",
+                "energy_full": "46000000",
+                "temp": "319",
+            }
+            for name, value in files.items():
+                with open(os.path.join(bat1, name), "w") as f:
+                    f.write(value)
+
+            plugin = main.Plugin()
+
+            with patch("main.BATTERY_PATH", os.path.join(power_supply, "BAT0")), patch(
+                "main.BATTERY_PATH_GLOBS", [os.path.join(power_supply, "BAT*")]
+            ), patch.object(
+                plugin,
+                "get_charge_limit_state",
+                return_value={"available": True, "enabled": True, "limit": 80},
+            ):
+                state = asyncio.run(plugin.get_battery_info())
+
+        self.assertTrue(state["present"])
+        self.assertEqual(state["capacity"], 73)
+        self.assertEqual(state["voltage"], 15.4)
+        self.assertEqual(state["current"], 1.8)
+        self.assertEqual(state["design_capacity"], 49)
+        self.assertEqual(state["full_capacity"], 46)
+        self.assertEqual(state["temperature"], 31.9)
+        self.assertEqual(state["charge_limit"], 80)
+        self.assertEqual(state["time_to_empty"], "1h 13m")
+        self.assertEqual(state["time_to_full"], "Unknown")
+
+    def test_battery_info_estimates_time_to_charge_limit_when_charging(self):
+        plugin = main.Plugin()
+        battery = {
+            "status": "Charging",
+            "capacity": 50,
+            "voltage": 15.0,
+            "current": 2.0,
+            "full_capacity": 40,
+            "design_capacity": 42,
+            "charge_limit": 80,
+        }
+
+        time_to_empty, time_to_full = plugin._estimate_battery_times(battery)
+
+        self.assertEqual(time_to_empty, "Unknown")
+        self.assertEqual(time_to_full, "24m")
+
+    def test_rgb_standard_multicolor_led_is_read_and_written(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            led = os.path.join(tmpdir, "legion:rgb:joystick")
+            os.makedirs(led)
+            with open(os.path.join(led, "brightness"), "w") as f:
+                f.write("255")
+            with open(os.path.join(led, "multi_index"), "w") as f:
+                f.write("red green blue")
+            with open(os.path.join(led, "multi_intensity"), "w") as f:
+                f.write("0 183 255")
+
+            plugin = main.Plugin()
+
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+                "main.ALLY_LED_PATH", os.path.join(tmpdir, "missing")
+            ), patch(
+                "main.RGB_LED_PATH_GLOBS", [os.path.join(tmpdir, "*:rgb:*")]
+            ):
+                state = asyncio.run(plugin.get_rgb_state())
+                success = asyncio.run(plugin.set_rgb_color("#00FF85"))
+
+            with open(os.path.join(led, "multi_intensity"), "r") as f:
+                values = f.read()
+
+        self.assertTrue(state["available"])
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["color"], "#00B7FF")
+        self.assertTrue(success)
+        self.assertEqual(values, "0 255 133")
+
+    def test_rgb_legacy_packed_led_format_still_works_for_ally(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            led = os.path.join(tmpdir, "ally:rgb:joystick_rings")
+            os.makedirs(led)
+            with open(os.path.join(led, "brightness"), "w") as f:
+                f.write("255")
+            with open(os.path.join(led, "multi_intensity"), "w") as f:
+                f.write("47103 47103 47103 47103")
+
+            plugin = main.Plugin()
+
+            with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch(
+                "main.ALLY_LED_PATH", led
+            ), patch(
+                "main.RGB_LED_PATH_GLOBS", []
+            ):
+                state = asyncio.run(plugin.get_rgb_state())
+                success = asyncio.run(plugin.set_rgb_color("#00FF85"))
+
+            with open(os.path.join(led, "multi_intensity"), "r") as f:
+                values = f.read()
+
+        self.assertTrue(state["available"])
+        self.assertEqual(state["color"], "#00B7FF")
+        self.assertTrue(success)
+        self.assertEqual(values, "65413 65413 65413 65413")
+
+    def test_legion_go_s_hid_rgb_uses_huesync_device_ids(self):
+        plugin = main.Plugin()
+        plugin.settings_path = None
+        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00B7FF"}
+        FakeHidDevice.writes = []
+        FakeHidModule.devices = [
+            {
+                "path": b"/dev/hidraw-legion-go-s",
+                "vendor_id": 0x1A86,
+                "product_id": 0xE310,
+                "usage_page": 0xFFA0,
+                "usage": 0x0001,
+                "interface_number": 3,
+            }
+        ]
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_get_rgb_led_path", return_value=""
+        ), patch.object(
+            plugin, "_hid_module", return_value=FakeHidModule
+        ), patch.object(
+            plugin, "_hidraw_devices", return_value=[]
+        ):
+            state = asyncio.run(plugin.get_rgb_state())
+            success = asyncio.run(plugin.set_rgb_color("#00FF85"))
+
+        self.assertTrue(state["available"])
+        self.assertIn("Legion Go S", state["details"])
+        self.assertTrue(success)
+        self.assertEqual(FakeHidDevice.writes[0], bytes([0x04, 0x06, 0x01]))
+        self.assertEqual(FakeHidDevice.writes[1], bytes([0x10, 0x02, 0x03]))
+        self.assertEqual(FakeHidDevice.writes[2], bytes([0x10, 0x05, 0x00, 0x00, 0xFF, 0x85, 0x3F, 0x3F]))
+
+    def test_legion_go_tablet_hid_rgb_uses_huesync_device_ids(self):
+        plugin = main.Plugin()
+        plugin.settings_path = None
+        plugin.settings = {"rgb_enabled": True, "rgb_color": "#00B7FF"}
+        FakeHidDevice.writes = []
+        FakeHidModule.devices = [
+            {
+                "path": b"/dev/hidraw-legion-go",
+                "vendor_id": 0x17EF,
+                "product_id": 0x6182,
+                "usage_page": 0xFFA0,
+                "usage": 0x0001,
+                "interface_number": 0,
+            }
+        ]
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_get_rgb_led_path", return_value=""
+        ), patch.object(
+            plugin, "_hid_module", return_value=FakeHidModule
+        ), patch.object(
+            plugin, "_hidraw_devices", return_value=[]
+        ):
+            state = asyncio.run(plugin.get_rgb_state())
+            success = asyncio.run(plugin.set_rgb_enabled(False))
+
+        self.assertTrue(state["available"])
+        self.assertIn("Legion Go HID", state["details"])
+        self.assertTrue(success)
+        self.assertEqual(FakeHidDevice.writes[0], bytes([0x05, 0x06, 0x70, 0x02, 0x03, 0x00, 0x01]))
+        self.assertEqual(FakeHidDevice.writes[1], bytes([0x05, 0x06, 0x70, 0x02, 0x04, 0x00, 0x01]))
+
     def test_rgb_state_is_exposed_in_dashboard(self):
         plugin = main.Plugin()
         plugin.settings = {"rgb_enabled": True, "rgb_color": "#00B7FF", "fps_limit": 0}
@@ -654,25 +907,15 @@ eDP-1 connected primary 1920x1080+0+0
 
 
 class OptimizationStateTest(unittest.TestCase):
-    def test_grub_healer_script_does_not_lock_cpu_boost(self):
-        self.assertNotIn("cpufreq/boost", main.GRUB_HEALER_SCRIPT_CONTENT)
-        self.assertNotIn("echo 0", main.GRUB_HEALER_SCRIPT_CONTENT)
-
-    def test_memory_state_reports_configured_and_active(self):
+    def test_swap_protect_state_reports_configured_and_active(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sysctl_path = os.path.join(tmpdir, "memory.conf")
-            thp_config_path = os.path.join(tmpdir, "thp.conf")
             atomic_path = os.path.join(tmpdir, "atomic.conf")
-            thp_enabled_path = os.path.join(tmpdir, "thp_enabled")
 
             with open(sysctl_path, "w") as f:
                 f.write(main.MEMORY_SYSCTL_CONTENT)
-            with open(thp_config_path, "w") as f:
-                f.write(main.THP_TMPFILES_CONTENT)
             with open(atomic_path, "w") as f:
-                f.write(f"{sysctl_path}\n{thp_config_path}\n")
-            with open(thp_enabled_path, "w") as f:
-                f.write("always [madvise] never")
+                f.write(f"{sysctl_path}\n")
 
             plugin = main.Plugin()
 
@@ -684,19 +927,41 @@ class OptimizationStateTest(unittest.TestCase):
                 }.get(key, "")
 
             with patch("main.MEMORY_SYSCTL_PATH", sysctl_path), patch(
-                "main.THP_TMPFILES_PATH", thp_config_path
-            ), patch("main.ATOMIC_MANIFEST_PATH", atomic_path), patch(
-                "main.THP_ENABLED_PATH", thp_enabled_path
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
             ), patch.object(plugin, "_read_sysctl", side_effect=fake_read_sysctl), patch.object(
                 plugin, "_command_exists", return_value=True
             ):
-                state = plugin._get_memory_state()
+                state = plugin._get_swap_protect_state()
 
         self.assertTrue(state["enabled"])
         self.assertTrue(state["active"])
         self.assertFalse(state["needs_reboot"])
         self.assertEqual(state["status"], "active")
-        self.assertIn("Transparent Huge Pages", state["description"])
+        self.assertIn("memory sysctl", state["description"])
+
+    def test_thp_madvise_state_reports_configured_and_active(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            thp_config_path = os.path.join(tmpdir, "thp.conf")
+            atomic_path = os.path.join(tmpdir, "atomic.conf")
+            thp_enabled_path = os.path.join(tmpdir, "thp_enabled")
+
+            with open(thp_config_path, "w") as f:
+                f.write(main.THP_TMPFILES_CONTENT)
+            with open(atomic_path, "w") as f:
+                f.write(f"{thp_config_path}\n")
+            with open(thp_enabled_path, "w") as f:
+                f.write("always [madvise] never")
+
+            plugin = main.Plugin()
+
+            with patch("main.THP_TMPFILES_PATH", thp_config_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
+            ), patch("main.THP_ENABLED_PATH", thp_enabled_path):
+                state = plugin._get_thp_madvise_state()
+
+        self.assertTrue(state["enabled"])
+        self.assertTrue(state["active"])
+        self.assertFalse(state["needs_reboot"])
 
     def test_atomic_manifest_is_single_file_and_cleans_legacy_manifests(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -728,13 +993,13 @@ class OptimizationStateTest(unittest.TestCase):
             ), patch(
                 "main.USB_WAKE_SERVICE_PATH", os.path.join(tmpdir, "usb.service")
             ), patch(
-                "main.GRUB_HEALER_SCRIPT_PATH", os.path.join(tmpdir, "grub.sh")
-            ), patch(
-                "main.GRUB_HEALER_SERVICE_PATH", os.path.join(tmpdir, "grub.service")
+                "main.GRUB_DEFAULT_PATH", os.path.join(tmpdir, "grub")
             ), patch(
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
             ), patch(
                 "main.LEGACY_ATOMIC_PATHS", legacy_paths
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
             ):
                 plugin._refresh_atomic_manifest()
 
@@ -747,6 +1012,38 @@ class OptimizationStateTest(unittest.TestCase):
         self.assertIn(thp_path, manifest)
         self.assertNotIn("xbox-companion-scx.conf", manifest)
         self.assertTrue(legacy_removed)
+
+    def test_lavd_disable_restores_previous_scx_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "scx")
+            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            state_path = os.path.join(tmpdir, "optimization-state.json")
+            previous = 'SCX_SCHEDULER="scx_rustland"\nSCX_FLAGS="--custom"\n'
+            with open(scx_path, "w") as f:
+                f.write(previous)
+
+            plugin = main.Plugin()
+
+            with patch("main.SCX_DEFAULT_PATH", scx_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
+            ), patch(
+                "main.OPTIMIZATION_STATE_PATH", state_path
+            ), patch(
+                "main.LEGACY_ATOMIC_PATHS", []
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
+            ), patch.object(
+                plugin, "_command_exists", return_value=False
+            ), patch.object(
+                plugin, "_systemctl", return_value=""
+            ):
+                plugin._set_lavd_enabled(True)
+                plugin._set_lavd_enabled(False)
+
+            with open(scx_path, "r") as f:
+                restored = f.read()
+
+        self.assertEqual(restored, previous)
 
     def test_disabling_optimization_removes_only_its_atomic_entries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -771,18 +1068,18 @@ class OptimizationStateTest(unittest.TestCase):
             ), patch(
                 "main.USB_WAKE_SERVICE_PATH", os.path.join(tmpdir, "usb.service")
             ), patch(
-                "main.GRUB_HEALER_SCRIPT_PATH", os.path.join(tmpdir, "grub.sh")
-            ), patch(
-                "main.GRUB_HEALER_SERVICE_PATH", os.path.join(tmpdir, "grub.service")
+                "main.GRUB_DEFAULT_PATH", os.path.join(tmpdir, "grub")
             ), patch(
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
             ), patch(
                 "main.LEGACY_ATOMIC_PATHS", []
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_run_optional_command", return_value=""
             ):
                 plugin._refresh_atomic_manifest()
-                plugin._set_memory_enabled(False)
+                plugin._set_swap_protect_enabled(False)
 
                 with open(manifest_path, "r") as f:
                     manifest = f.read()
@@ -791,9 +1088,9 @@ class OptimizationStateTest(unittest.TestCase):
 
         self.assertIn(scx_path, manifest)
         self.assertNotIn(memory_path, manifest)
-        self.assertNotIn(thp_path, manifest)
+        self.assertIn(thp_path, manifest)
         self.assertFalse(memory_exists)
-        self.assertFalse(thp_exists)
+        self.assertTrue(thp_exists)
 
     def test_atomic_manifest_is_removed_when_last_optimization_is_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -815,31 +1112,27 @@ class OptimizationStateTest(unittest.TestCase):
             ), patch(
                 "main.USB_WAKE_SERVICE_PATH", os.path.join(tmpdir, "usb.service")
             ), patch(
-                "main.GRUB_HEALER_SCRIPT_PATH", os.path.join(tmpdir, "grub.sh")
-            ), patch(
-                "main.GRUB_HEALER_SERVICE_PATH", os.path.join(tmpdir, "grub.service")
+                "main.GRUB_DEFAULT_PATH", os.path.join(tmpdir, "grub")
             ), patch(
                 "main.ATOMIC_MANIFEST_PATH", manifest_path
             ), patch(
                 "main.LEGACY_ATOMIC_PATHS", []
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
             ), patch.object(
                 plugin, "_run_optional_command", return_value=""
             ):
                 plugin._refresh_atomic_manifest()
-                plugin._set_memory_enabled(False)
+                plugin._set_swap_protect_enabled(False)
+                plugin._set_thp_madvise_enabled(False)
                 manifest_exists = os.path.exists(manifest_path)
 
         self.assertFalse(manifest_exists)
 
-    def test_memory_state_reports_reboot_required_when_runtime_tuning_remains_after_disable(self):
+    def test_swap_protect_state_reports_reboot_required_when_runtime_tuning_remains_after_disable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = os.path.join(tmpdir, "memory.conf")
-            thp_path = os.path.join(tmpdir, "thp.conf")
             manifest_path = os.path.join(tmpdir, "xbox-companion.conf")
-            thp_enabled_path = os.path.join(tmpdir, "thp_enabled")
-
-            with open(thp_enabled_path, "w") as f:
-                f.write("always [madvise] never")
 
             plugin = main.Plugin()
 
@@ -851,45 +1144,242 @@ class OptimizationStateTest(unittest.TestCase):
                 }.get(key, "")
 
             with patch("main.MEMORY_SYSCTL_PATH", memory_path), patch(
-                "main.THP_TMPFILES_PATH", thp_path
-            ), patch("main.ATOMIC_MANIFEST_PATH", manifest_path), patch(
-                "main.THP_ENABLED_PATH", thp_enabled_path
+                "main.ATOMIC_MANIFEST_PATH", manifest_path
             ), patch.object(plugin, "_read_sysctl", side_effect=fake_read_sysctl), patch.object(
                 plugin, "_command_exists", return_value=True
             ):
-                state = plugin._get_memory_state()
+                state = plugin._get_swap_protect_state()
 
         self.assertFalse(state["enabled"])
         self.assertTrue(state["active"])
         self.assertTrue(state["needs_reboot"])
         self.assertEqual(state["status"], "reboot-required")
 
+    def test_kernel_param_state_uses_grub_and_atomic_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grub_path = os.path.join(tmpdir, "grub")
+            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            state_path = os.path.join(tmpdir, "optimization-state.json")
+            with open(grub_path, "w") as f:
+                f.write('GRUB_CMDLINE_LINUX_DEFAULT="amd_pstate=active"\n')
+            with open(atomic_path, "w") as f:
+                f.write(f"{grub_path}\n")
+            with open(state_path, "w") as f:
+                json.dump({"kernel_params": {"amd_pstate=active": {"was_configured": False}}}, f)
+
+            plugin = main.Plugin()
+
+            with patch("main.GRUB_DEFAULT_PATH", grub_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
+            ), patch(
+                "main.OPTIMIZATION_STATE_PATH", state_path
+            ), patch.object(plugin, "_is_amd_platform", return_value=True), patch.object(
+                plugin, "_read_cmdline", return_value="quiet amd_pstate=active"
+            ):
+                state = plugin._get_kernel_param_state(
+                    "kernel_amd_pstate",
+                    main.GRUB_KERNEL_PARAM_OPTIONS["kernel_amd_pstate"],
+                )
+
+        self.assertTrue(state["enabled"])
+        self.assertTrue(state["active"])
+        self.assertFalse(state["needs_reboot"])
+        self.assertEqual(state["status"], "active")
+
+    def test_update_grub_param_refreshes_atomic_manifest_and_removes_legacy_healer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grub_path = os.path.join(tmpdir, "grub")
+            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            state_path = os.path.join(tmpdir, "optimization-state.json")
+            legacy_script = os.path.join(tmpdir, "grub-healer.sh")
+            legacy_service = os.path.join(tmpdir, "grub-healer.service")
+            with open(grub_path, "w") as f:
+                f.write('GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n')
+            for path in [legacy_script, legacy_service]:
+                with open(path, "w") as f:
+                    f.write("legacy\n")
+
+            plugin = main.Plugin()
+
+            with patch("main.GRUB_DEFAULT_PATH", grub_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
+            ), patch(
+                "main.OPTIMIZATION_STATE_PATH", state_path
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", [legacy_script, legacy_service]
+            ), patch(
+                "main.LEGACY_ATOMIC_PATHS", []
+            ), patch.object(
+                plugin, "_is_amd_platform", return_value=True
+            ), patch.object(
+                plugin, "_command_exists", return_value=False
+            ):
+                plugin._set_kernel_param_enabled("amd_pstate=active", True)
+
+            with open(grub_path, "r") as f:
+                grub_contents = f.read()
+            with open(atomic_path, "r") as f:
+                manifest = f.read()
+
+        self.assertIn("quiet amd_pstate=active", grub_contents)
+        self.assertIn(grub_path, manifest)
+        self.assertFalse(os.path.exists(legacy_script))
+        self.assertFalse(os.path.exists(legacy_service))
+
+    def test_kernel_param_disable_preserves_preexisting_grub_setting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grub_path = os.path.join(tmpdir, "grub")
+            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            state_path = os.path.join(tmpdir, "optimization-state.json")
+            with open(grub_path, "w") as f:
+                f.write('GRUB_CMDLINE_LINUX_DEFAULT="quiet amd_pstate=active"\n')
+
+            plugin = main.Plugin()
+
+            with patch("main.GRUB_DEFAULT_PATH", grub_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
+            ), patch(
+                "main.OPTIMIZATION_STATE_PATH", state_path
+            ), patch(
+                "main.LEGACY_ATOMIC_PATHS", []
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
+            ), patch.object(
+                plugin, "_is_amd_platform", return_value=True
+            ), patch.object(
+                plugin, "_command_exists", return_value=False
+            ):
+                plugin._set_kernel_param_enabled("amd_pstate=active", True)
+                plugin._set_kernel_param_enabled("amd_pstate=active", False)
+
+            with open(grub_path, "r") as f:
+                grub_contents = f.read()
+
+        self.assertIn("amd_pstate=active", grub_contents)
+        self.assertFalse(os.path.exists(atomic_path))
+
+    def test_swap_protect_disable_restores_previous_runtime_sysctls(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_path = os.path.join(tmpdir, "memory.conf")
+            atomic_path = os.path.join(tmpdir, "xbox-companion.conf")
+            state_path = os.path.join(tmpdir, "optimization-state.json")
+            writes = []
+
+            plugin = main.Plugin()
+
+            def fake_read_sysctl(key):
+                return {
+                    "vm.swappiness": "100",
+                    "vm.min_free_kbytes": "65536",
+                    "vm.dirty_ratio": "20",
+                }.get(key, "")
+
+            with patch("main.MEMORY_SYSCTL_PATH", memory_path), patch(
+                "main.ATOMIC_MANIFEST_PATH", atomic_path
+            ), patch(
+                "main.OPTIMIZATION_STATE_PATH", state_path
+            ), patch(
+                "main.LEGACY_ATOMIC_PATHS", []
+            ), patch(
+                "main.LEGACY_MANAGED_PATHS", []
+            ), patch.object(
+                plugin, "_read_sysctl", side_effect=fake_read_sysctl
+            ), patch.object(
+                plugin, "_run_optional_command", return_value=""
+            ), patch.object(
+                plugin, "_write_sysctl", side_effect=lambda key, value: writes.append((key, value))
+            ):
+                plugin._set_swap_protect_enabled(True)
+                plugin._set_swap_protect_enabled(False)
+
+        self.assertIn(("vm.swappiness", "100"), writes)
+        self.assertIn(("vm.min_free_kbytes", "65536"), writes)
+        self.assertIn(("vm.dirty_ratio", "20"), writes)
+
     def test_unknown_optimization_is_rejected(self):
         plugin = main.Plugin()
         result = asyncio.run(plugin.set_optimization_enabled("unknown", True))
         self.assertFalse(result)
 
-    def test_power_optimization_is_gated_on_non_amd_platform(self):
+    def test_npu_blacklist_is_gated_when_no_npu_is_detected(self):
         plugin = main.Plugin()
 
         with patch.object(plugin, "_command_exists", return_value=True), patch.object(
             plugin,
             "_is_amd_platform",
+            return_value=True,
+        ), patch.object(
+            plugin,
+            "_amd_npu_present",
             return_value=False,
         ):
-            state = plugin._get_power_state()
+            state = plugin._get_npu_blacklist_state()
 
         self.assertFalse(state["available"])
+
+    def test_optimization_states_are_exposed_as_granular_controls(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_migrate_atomic_manifest_if_needed", return_value=None
+        ), patch.object(plugin, "_command_exists", return_value=True), patch.object(
+            plugin, "_is_amd_platform", return_value=True
+        ), patch.object(plugin, "_amd_npu_present", return_value=True), patch.object(
+            plugin, "_usb_wake_control_available", return_value=True
+        ), patch("main.os.path.exists", return_value=True):
+            state = asyncio.run(plugin.get_optimization_states())
+
+        keys = {item["key"] for item in state["states"]}
+        self.assertIn("swap_protect", keys)
+        self.assertIn("thp_madvise", keys)
+        self.assertIn("npu_blacklist", keys)
+        self.assertIn("usb_wake", keys)
+        self.assertIn("kernel_amd_pstate", keys)
+        self.assertIn("kernel_abm_off", keys)
+
+    def test_enable_available_optimizations_skips_unavailable_controls(self):
+        plugin = main.Plugin()
+        calls = []
+
+        def fake_set(enabled):
+            calls.append(("swap_protect", enabled))
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin,
+            "get_optimization_states",
+            return_value={
+                "states": [
+                    {"key": "swap_protect", "name": "Swap Protection", "available": True, "enabled": False},
+                    {"key": "npu_blacklist", "name": "NPU Blacklist", "available": False, "enabled": False, "details": "No NPU"},
+                    {"key": "thp_madvise", "name": "THP Madvise", "available": True, "enabled": True},
+                ]
+            },
+        ), patch.object(
+            plugin,
+            "_optimization_handlers",
+            return_value={"swap_protect": fake_set, "npu_blacklist": fake_set, "thp_madvise": fake_set},
+        ), patch.object(
+            plugin,
+            "_optimization_state_readers",
+            return_value={"swap_protect": lambda: {"available": True, "enabled": True}},
+        ):
+            result = asyncio.run(plugin.enable_available_optimizations())
+
+        self.assertTrue(result["success"])
+        self.assertEqual(calls, [("swap_protect", True)])
+        self.assertEqual(result["enabled"][0]["key"], "swap_protect")
+        self.assertEqual(result["skipped"][0]["key"], "npu_blacklist")
+        self.assertEqual(result["already_enabled"][0]["key"], "thp_madvise")
 
     def test_optimization_toggle_verifies_resulting_state(self):
         plugin = main.Plugin()
 
-        with patch.object(plugin, "_set_memory_enabled", return_value=None), patch.object(
+        with patch.object(plugin, "_set_swap_protect_enabled", return_value=None), patch.object(
             plugin,
-            "_get_memory_state",
+            "_get_swap_protect_state",
             return_value={"enabled": False},
         ):
-            result = asyncio.run(plugin.set_optimization_enabled("memory", True))
+            result = asyncio.run(plugin.set_optimization_enabled("swap_protect", True))
 
         self.assertFalse(result)
 
@@ -897,27 +1387,27 @@ class OptimizationStateTest(unittest.TestCase):
         plugin = main.Plugin()
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
-            plugin, "_set_memory_enabled", return_value=None
+            plugin, "_set_swap_protect_enabled", return_value=None
         ), patch.object(
             plugin,
-            "_get_memory_state",
+            "_get_swap_protect_state",
             return_value={"enabled": False, "active": True},
         ):
-            result = asyncio.run(plugin.set_optimization_enabled("memory", False))
+            result = asyncio.run(plugin.set_optimization_enabled("swap_protect", False))
 
-        self.assertFalse(result)
+        self.assertTrue(result)
 
     def test_optimization_disable_accepts_only_clean_rollback(self):
         plugin = main.Plugin()
 
         with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
-            plugin, "_set_memory_enabled", return_value=None
+            plugin, "_set_swap_protect_enabled", return_value=None
         ), patch.object(
             plugin,
-            "_get_memory_state",
+            "_get_swap_protect_state",
             return_value={"enabled": False, "active": False},
         ):
-            result = asyncio.run(plugin.set_optimization_enabled("memory", False))
+            result = asyncio.run(plugin.set_optimization_enabled("swap_protect", False))
 
         self.assertTrue(result)
 

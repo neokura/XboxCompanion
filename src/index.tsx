@@ -21,6 +21,9 @@ const getOptimizationStates = callable<[], OptimizationData>(
 const setOptimizationEnabled = callable<[string, boolean], boolean>(
   "set_optimization_enabled"
 );
+const enableAvailableOptimizations = callable<[], BulkOptimizationResult>(
+  "enable_available_optimizations"
+);
 const getInformationState = callable<[], InformationState>(
   "get_information_state"
 );
@@ -110,6 +113,20 @@ interface OptimizationData {
   states: OptimizationState[];
 }
 
+interface BulkOptimizationItem {
+  key: string;
+  name: string;
+  reason?: string;
+}
+
+interface BulkOptimizationResult {
+  success: boolean;
+  enabled: BulkOptimizationItem[];
+  already_enabled: BulkOptimizationItem[];
+  skipped: BulkOptimizationItem[];
+  failed: BulkOptimizationItem[];
+}
+
 interface DeviceInfo {
   friendly_name: string;
   board_name: string;
@@ -186,7 +203,7 @@ const subtextStyle: React.CSSProperties = {
 const cardStyle: React.CSSProperties = {
   background: "linear-gradient(180deg, rgba(36,42,49,0.95), rgba(25,29,35,0.95))",
   border: "1px solid rgba(100, 116, 139, 0.35)",
-  borderRadius: "14px",
+  borderRadius: "8px",
   padding: "14px",
   marginBottom: "12px",
 };
@@ -194,6 +211,7 @@ const cardStyle: React.CSSProperties = {
 const statusRowStyle: React.CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
+  alignItems: "flex-start",
   gap: "12px",
   marginBottom: "6px",
 };
@@ -201,17 +219,29 @@ const statusRowStyle: React.CSSProperties = {
 const infoLabelStyle: React.CSSProperties = {
   color: "#8b929a",
   fontSize: "12px",
+  flex: "0 0 38%",
 };
 
 const infoValueStyle: React.CSSProperties = {
   color: "#ffffff",
   fontSize: "12px",
   textAlign: "right",
+  flex: "1 1 auto",
+  overflowWrap: "anywhere",
+  wordBreak: "break-word",
+  lineHeight: 1.4,
 };
 
-const presetGridStyle: React.CSSProperties = {
+const colorPresetGridStyle: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+  gap: "8px",
+  width: "100%",
+};
+
+const optionGridStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
   gap: "8px",
   width: "100%",
 };
@@ -269,7 +299,7 @@ const formatToggleLabel = (
 };
 
 const formatFpsLabel = (value: number): string =>
-  value === 0 ? "No limit / Disabled" : `${value} FPS`;
+  value === 0 ? "Unlimited" : `${value} FPS`;
 
 const hardwareControlLabels: Record<string, string> = {
   performance_profiles: "SteamOS profiles",
@@ -283,8 +313,24 @@ const hardwareControlLabels: Record<string, string> = {
   optimizations: "Optimizations",
 };
 
-const formatNumber = (value: number, unit: string): string =>
-  Number.isFinite(value) && value > 0 ? `${value.toFixed(1)} ${unit}` : "Unknown";
+const formatMeasurementValue = (value: number): string =>
+  Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1);
+
+const formatPositiveMeasurement = (value: number, unit: string): string =>
+  Number.isFinite(value) && value > 0 ? `${formatMeasurementValue(value)} ${unit}` : "Unknown";
+
+const formatSignedMeasurement = (value: number, unit: string): string =>
+  Number.isFinite(value) ? `${formatMeasurementValue(value)} ${unit}` : "Unknown";
+
+const describeError = (error: unknown): string => {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  return "The plugin could not refresh this view.";
+};
 
 const formatDisplayStatus = (setting?: AvailabilityToggle): string => {
   if (!setting?.available) {
@@ -326,9 +372,38 @@ const ViewHeader: VFC<{
   </PanelSection>
 );
 
+const StatusCard: VFC<{
+  title: string;
+  message: string;
+  tone?: "neutral" | "error";
+}> = ({ title, message, tone = "neutral" }) => (
+  <div
+    style={{
+      ...cardStyle,
+      border:
+        tone === "error"
+          ? "1px solid rgba(248, 113, 113, 0.4)"
+          : "1px solid rgba(100, 116, 139, 0.35)",
+      marginBottom: 0,
+    }}
+  >
+    <div
+      style={{
+        ...viewTitleStyle,
+        fontSize: "15px",
+        color: tone === "error" ? "#fecaca" : "#ffffff",
+      }}
+    >
+      {title}
+    </div>
+    <div style={subtextStyle}>{message}</div>
+  </div>
+);
+
 const DashboardView: VFC<{
   data: DashboardState | null;
   loading: boolean;
+  error: string | null;
   busyKey: string | null;
   onRefresh: () => Promise<void>;
   onOpenOptimizations: () => void;
@@ -336,111 +411,149 @@ const DashboardView: VFC<{
 }> = ({
   data,
   loading,
+  error,
   busyKey,
   onRefresh,
   onOpenOptimizations,
   onOpenInformation,
 }) => {
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const controlsDisabled = busyKey !== null || actionBusy !== null;
   const fpsPresets = data?.fps_limit.presets?.length
     ? data.fps_limit.presets
     : [30, 40, 60, 0];
 
+  const runAction = async (
+    actionKey: string,
+    operation: () => Promise<boolean>,
+    successMessage: string,
+    failureMessage: string
+  ) => {
+    if (controlsDisabled) {
+      return;
+    }
+
+    setActionBusy(actionKey);
+    let success = false;
+    try {
+      success = await operation();
+      toaster.toast({
+        title: PLUGIN_NAME,
+        body: success ? successMessage : failureMessage,
+      });
+      await onRefresh();
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
   const handlePerformanceProfile = async (profileId: string, label: string) => {
-    const success = await setPerformanceProfile(profileId);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success ? `${label} SteamOS profile applied` : "Could not apply this SteamOS profile",
-    });
-    await onRefresh();
+    await runAction(
+      `profile:${profileId}`,
+      () => setPerformanceProfile(profileId),
+      `${label} SteamOS profile applied`,
+      "Could not apply this SteamOS profile"
+    );
   };
 
   const handleBoost = async (enabled: boolean) => {
-    const success = await setCpuBoostEnabled(enabled);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `CPU Boost ${enabled ? "enabled" : "disabled"}`
-        : "Could not change CPU Boost",
-    });
-    await onRefresh();
+    await runAction(
+      "cpu-boost",
+      () => setCpuBoostEnabled(enabled),
+      `CPU Boost ${enabled ? "enabled" : "disabled"}`,
+      "Could not change CPU Boost"
+    );
   };
 
   const handleSmt = async (enabled: boolean) => {
-    const success = await setSmtEnabled(enabled);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `SMT ${enabled ? "enabled" : "disabled"}`
-        : "Could not change SMT",
-    });
-    await onRefresh();
+    await runAction(
+      "smt",
+      () => setSmtEnabled(enabled),
+      `SMT ${enabled ? "enabled" : "disabled"}`,
+      "Could not change SMT"
+    );
   };
 
   const handleChargeLimit = async (enabled: boolean) => {
-    const success = await setChargeLimitEnabled(enabled);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `Charge limit ${enabled ? "enabled at 80%" : "disabled"}`
-        : "Could not change the charge limit",
-    });
-    await onRefresh();
+    await runAction(
+      "charge-limit",
+      () => setChargeLimitEnabled(enabled),
+      `Charge limit ${enabled ? "enabled at 80%" : "disabled"}`,
+      "Could not change the charge limit"
+    );
   };
 
   const handleSync = async (key: "vrr" | "vsync", enabled: boolean) => {
-    const success = await setDisplaySyncSetting(key, enabled);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `${key === "vrr" ? "VRR" : "V-Sync"} ${enabled ? "enabled" : "disabled"}`
-        : `Could not change ${key === "vrr" ? "VRR" : "V-Sync"}`,
-    });
-    await onRefresh();
+    await runAction(
+      key,
+      () => setDisplaySyncSetting(key, enabled),
+      `${key === "vrr" ? "VRR" : "V-Sync"} ${enabled ? "enabled" : "disabled"}`,
+      `Could not change ${key === "vrr" ? "VRR" : "V-Sync"}`
+    );
   };
 
   const commitFpsLimit = async (value: number) => {
-    const success = await setFpsLimit(value);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `Max framerate: ${formatFpsLabel(value)}`
-        : "Could not change the max framerate",
-    });
-    await onRefresh();
+    await runAction(
+      `fps:${value}`,
+      () => setFpsLimit(value),
+      `Max framerate: ${formatFpsLabel(value)}`,
+      "Could not change the max framerate"
+    );
   };
 
   const handleRgbToggle = async (enabled: boolean) => {
-    const success = await setRgbEnabled(enabled);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `RGB ${enabled ? "enabled" : "disabled"}`
-        : "Could not change RGB",
-    });
-    await onRefresh();
+    await runAction(
+      "rgb-toggle",
+      () => setRgbEnabled(enabled),
+      `RGB ${enabled ? "enabled" : "disabled"}`,
+      "Could not change RGB"
+    );
   };
 
   const handleRgbColor = async (color: string) => {
-    const success = await setRgbColor(color);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success ? `RGB color: ${color}` : "Could not change the RGB color",
-    });
-    await onRefresh();
+    await runAction(
+      `rgb:${color}`,
+      () => setRgbColor(color),
+      `RGB color: ${color}`,
+      "Could not change the RGB color"
+    );
   };
 
-  if (loading || !data) {
+  if (!data) {
     return (
       <PanelSection title="Dashboard">
         <PanelSectionRow>
-          <div style={{ ...cardStyle, ...subtextStyle }}>Loading dashboard...</div>
+          <div style={{ ...cardStyle, ...subtextStyle }}>
+            {loading ? "Loading dashboard..." : "Dashboard data is unavailable right now."}
+          </div>
         </PanelSectionRow>
+        {error && (
+          <PanelSectionRow>
+            <StatusCard title="Refresh Failed" message={error} tone="error" />
+          </PanelSectionRow>
+        )}
+        {!loading && (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => void onRefresh()}>
+              Retry
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
       </PanelSection>
     );
   }
 
   return (
     <PanelSection title="Dashboard">
+      {error && (
+        <PanelSectionRow>
+          <StatusCard
+            title="Last Refresh Failed"
+            message={error}
+            tone="error"
+          />
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <div style={cardStyle}>
           <div style={viewTitleStyle}>Performance Modes</div>
@@ -461,9 +574,9 @@ const DashboardView: VFC<{
           <ButtonItem
             layout="below"
             onClick={() => handlePerformanceProfile(mode.native_id, mode.label)}
-            disabled={!mode.available || busyKey !== null}
+            disabled={!mode.available || controlsDisabled}
           >
-            <div style={modeButtonStyle(mode.active, !mode.available || busyKey !== null)}>
+            <div style={modeButtonStyle(mode.active, !mode.available || controlsDisabled)}>
               <div
                 style={{
                   display: "flex",
@@ -504,7 +617,7 @@ const DashboardView: VFC<{
           label={formatToggleLabel("CPU Boost", data.cpu_boost)}
           description={data.cpu_boost.details}
           checked={data.cpu_boost.enabled}
-          disabled={!data.cpu_boost.available || busyKey !== null}
+          disabled={!data.cpu_boost.available || controlsDisabled}
           onChange={handleBoost}
         />
       </PanelSectionRow>
@@ -514,7 +627,7 @@ const DashboardView: VFC<{
           label={formatToggleLabel("SMT", data.smt)}
           description={data.smt.details}
           checked={data.smt.enabled}
-          disabled={!data.smt.available || busyKey !== null}
+          disabled={!data.smt.available || controlsDisabled}
           onChange={handleSmt}
         />
       </PanelSectionRow>
@@ -526,7 +639,7 @@ const DashboardView: VFC<{
           }`}
           description={data.charge_limit.details}
           checked={data.charge_limit.enabled}
-          disabled={!data.charge_limit.available || busyKey !== null}
+          disabled={!data.charge_limit.available || controlsDisabled}
           onChange={handleChargeLimit}
         />
       </PanelSectionRow>
@@ -538,18 +651,18 @@ const DashboardView: VFC<{
               label={`RGB: ${data.rgb.enabled ? "enabled" : "disabled"}`}
               description={data.rgb.details}
               checked={data.rgb.enabled}
-              disabled={!data.rgb.available || busyKey !== null}
+              disabled={!data.rgb.available || controlsDisabled}
               onChange={handleRgbToggle}
             />
           </PanelSectionRow>
           {data.rgb.enabled && (
             <PanelSectionRow>
-              <div style={presetGridStyle}>
+              <div style={colorPresetGridStyle}>
                 {(data.rgb.presets?.length ? data.rgb.presets : RGB_PRESETS).map((color) => (
                   <ButtonItem
                     key={color}
                     layout="below"
-                    disabled={!data.rgb.available || busyKey !== null}
+                    disabled={!data.rgb.available || controlsDisabled}
                     onClick={() => handleRgbColor(color)}
                   >
                     <div
@@ -580,7 +693,7 @@ const DashboardView: VFC<{
               : data.vrr.status || data.vrr.details
           }
           checked={data.vrr.enabled}
-          disabled={!data.vrr.available || busyKey !== null}
+          disabled={!data.vrr.available || controlsDisabled}
           onChange={(enabled: boolean) => handleSync("vrr", enabled)}
         />
       </PanelSectionRow>
@@ -594,7 +707,7 @@ const DashboardView: VFC<{
               : data.vsync.status || data.vsync.details
           }
           checked={data.vsync.enabled}
-          disabled={!data.vsync.available || busyKey !== null}
+          disabled={!data.vsync.available || controlsDisabled}
           onChange={(enabled: boolean) => handleSync("vsync", enabled)}
         />
       </PanelSectionRow>
@@ -606,12 +719,12 @@ const DashboardView: VFC<{
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <div style={presetGridStyle}>
+        <div style={optionGridStyle}>
           {fpsPresets.map((preset) => (
             <ButtonItem
               key={preset}
               layout="below"
-              disabled={!data.fps_limit.available || busyKey !== null}
+              disabled={!data.fps_limit.available || controlsDisabled}
               onClick={() => commitFpsLimit(preset)}
             >
               <div style={presetButtonStyle(data.fps_limit.current === preset)}>
@@ -639,22 +752,77 @@ const DashboardView: VFC<{
 const OptimizationsView: VFC<{
   data: OptimizationData | null;
   loading: boolean;
+  error: string | null;
   busyKey: string | null;
   onBack: () => void;
   onRefresh: () => Promise<void>;
-}> = ({ data, loading, busyKey, onBack, onRefresh }) => {
+}> = ({ data, loading, error, busyKey, onBack, onRefresh }) => {
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const controlsDisabled = busyKey !== null || actionBusy !== null;
+
+  const runAction = async (
+    actionKey: string,
+    operation: () => Promise<void>,
+    successMessage: string,
+    failureMessage: string
+  ) => {
+    if (controlsDisabled) {
+      return;
+    }
+
+    setActionBusy(actionKey);
+    let success = true;
+    try {
+      await operation();
+    } catch (_error) {
+      success = false;
+    }
+    toaster.toast({
+      title: PLUGIN_NAME,
+      body: success ? successMessage : failureMessage,
+    });
+    try {
+      await onRefresh();
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleEnableAvailable = async () => {
+    if (controlsDisabled) {
+      return;
+    }
+
+    setActionBusy("enable-available");
+    try {
+      const result = await enableAvailableOptimizations();
+      toaster.toast({
+        title: PLUGIN_NAME,
+        body: result.success
+          ? `Enabled ${result.enabled.length}; skipped ${result.skipped.length}.`
+          : `Enabled ${result.enabled.length}; ${result.failed.length} failed.`,
+      });
+      await onRefresh();
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
   const handleOptimizationToggle = async (
     optimization: OptimizationState,
     enabled: boolean
   ) => {
-    const success = await setOptimizationEnabled(optimization.key, enabled);
-    toaster.toast({
-      title: PLUGIN_NAME,
-      body: success
-        ? `${optimization.name} ${enabled ? "enabled" : "disabled"}`
-        : `Could not change ${optimization.name}`,
-    });
-    await onRefresh();
+    await runAction(
+      optimization.key,
+      async () => {
+        const success = await setOptimizationEnabled(optimization.key, enabled);
+        if (!success) {
+          throw new Error("toggle failed");
+        }
+      },
+      `${optimization.name} ${enabled ? "enabled" : "disabled"}`,
+      `Could not change ${optimization.name}`
+    );
   };
 
   return (
@@ -664,21 +832,52 @@ const OptimizationsView: VFC<{
         subtitle="Optional optimizations that can be disabled, sometimes requiring a reboot."
         onBack={onBack}
       />
-      {loading || !data ? (
+      {!data ? (
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ ...cardStyle, ...subtextStyle }}>Loading optimizations...</div>
+            <div style={{ ...cardStyle, ...subtextStyle }}>
+              {loading ? "Loading optimizations..." : "Optimization data is unavailable right now."}
+            </div>
           </PanelSectionRow>
+          {error && (
+            <PanelSectionRow>
+              <StatusCard title="Refresh Failed" message={error} tone="error" />
+            </PanelSectionRow>
+          )}
+          {!loading && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => void onRefresh()}>
+                Retry
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       ) : (
         <PanelSection title="Optimizations">
+          {error && (
+            <PanelSectionRow>
+              <StatusCard title="Last Refresh Failed" message={error} tone="error" />
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={
+                controlsDisabled ||
+                !data.states.some((optimization) => optimization.available && !optimization.enabled)
+              }
+              onClick={handleEnableAvailable}
+            >
+              Enable Available Optimizations
+            </ButtonItem>
+          </PanelSectionRow>
           {data.states.map((optimization) => (
             <PanelSectionRow key={optimization.key}>
               <ToggleField
                 label={`${optimization.name}: ${optimization.status}`}
                 description={`${optimization.description} ${optimization.needs_reboot ? "Reboot required. " : ""}${optimization.risk_note}`.trim()}
                 checked={optimization.enabled}
-                disabled={!optimization.available || busyKey !== null}
+                disabled={!optimization.available || controlsDisabled}
                 onChange={(enabled: boolean) =>
                   handleOptimizationToggle(optimization, enabled)
                 }
@@ -694,8 +893,10 @@ const OptimizationsView: VFC<{
 const InformationView: VFC<{
   data: InformationState | null;
   loading: boolean;
+  error: string | null;
   onBack: () => void;
-}> = ({ data, loading, onBack }) => {
+  onRefresh: () => Promise<void>;
+}> = ({ data, loading, error, onBack, onRefresh }) => {
   return (
     <div>
       <ViewHeader
@@ -703,14 +904,35 @@ const InformationView: VFC<{
         subtitle="Detailed technical status for the handheld and available controls."
         onBack={onBack}
       />
-      {loading || !data ? (
+      {!data ? (
         <PanelSection>
           <PanelSectionRow>
-            <div style={{ ...cardStyle, ...subtextStyle }}>Loading information...</div>
+            <div style={{ ...cardStyle, ...subtextStyle }}>
+              {loading ? "Loading information..." : "Information data is unavailable right now."}
+            </div>
           </PanelSectionRow>
+          {error && (
+            <PanelSectionRow>
+              <StatusCard title="Refresh Failed" message={error} tone="error" />
+            </PanelSectionRow>
+          )}
+          {!loading && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => void onRefresh()}>
+                Retry
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       ) : (
         <div>
+          {error && (
+            <PanelSection title="Status">
+              <PanelSectionRow>
+                <StatusCard title="Last Refresh Failed" message={error} tone="error" />
+              </PanelSectionRow>
+            </PanelSection>
+          )}
           <PanelSection title="Device">
             <PanelSectionRow>
               <div style={cardStyle}>
@@ -738,15 +960,15 @@ const InformationView: VFC<{
                 <InfoRow label="RAM" value={data.device.memory_total} />
                 <InfoRow
                   label="Temp CPU"
-                  value={`${data.temperatures.cpu.toFixed(0)} °C`}
+                  value={formatPositiveMeasurement(data.temperatures.cpu, "°C")}
                 />
                 <InfoRow
                   label="Temp GPU"
-                  value={`${data.temperatures.gpu.toFixed(0)} °C`}
+                  value={formatPositiveMeasurement(data.temperatures.gpu, "°C")}
                 />
                 <InfoRow
                   label="GPU Clock"
-                  value={`${data.temperatures.gpu_clock.toFixed(0)} MHz`}
+                  value={formatPositiveMeasurement(data.temperatures.gpu_clock, "MHz")}
                 />
               </div>
             </PanelSectionRow>
@@ -770,25 +992,27 @@ const InformationView: VFC<{
                 />
                 <InfoRow
                   label="Temperature"
-                  value={
-                    data.battery.temperature > 0
-                      ? `${data.battery.temperature} °C`
-                      : "Unknown"
-                  }
+                  value={formatPositiveMeasurement(data.battery.temperature, "°C")}
                 />
                 <InfoRow
                   label="Charge limit"
                   value={`${data.battery.charge_limit}%`}
                 />
-                <InfoRow label="Voltage" value={formatNumber(data.battery.voltage, "V")} />
-                <InfoRow label="Current" value={formatNumber(data.battery.current, "A")} />
+                <InfoRow
+                  label="Voltage"
+                  value={formatPositiveMeasurement(data.battery.voltage, "V")}
+                />
+                <InfoRow
+                  label="Current"
+                  value={formatSignedMeasurement(data.battery.current, "A")}
+                />
                 <InfoRow
                   label="Design capacity"
-                  value={formatNumber(data.battery.design_capacity, "Wh")}
+                  value={formatPositiveMeasurement(data.battery.design_capacity, "Wh")}
                 />
                 <InfoRow
                   label="Full capacity"
-                  value={formatNumber(data.battery.full_capacity, "Wh")}
+                  value={formatPositiveMeasurement(data.battery.full_capacity, "Wh")}
                 />
                 <InfoRow label="Time to empty" value={data.battery.time_to_empty || "Unknown"} />
                 <InfoRow label="Time to full" value={data.battery.time_to_full || "Unknown"} />
@@ -821,7 +1045,7 @@ const InformationView: VFC<{
                 />
                 <InfoRow
                   label="Current TDP"
-                  value={formatNumber(data.temperatures.tdp, "W")}
+                  value={formatPositiveMeasurement(data.temperatures.tdp, "W")}
                 />
               </div>
             </PanelSectionRow>
@@ -882,6 +1106,9 @@ const XboxCompanionContent: VFC = () => {
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [optimizations, setOptimizations] = useState<OptimizationData | null>(null);
   const [information, setInformation] = useState<InformationState | null>(null);
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [optimizationsError, setOptimizationsError] = useState<string | null>(null);
+  const [informationError, setInformationError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyKey, setBusyKey] = useState<string | null>(null);
 
@@ -892,8 +1119,12 @@ const XboxCompanionContent: VFC = () => {
     }
     try {
       setDashboard(await getDashboardState());
+      setDashboardError(null);
     } catch (error) {
       console.error("Failed to refresh dashboard:", error);
+      if (!silent) {
+        setDashboardError(describeError(error));
+      }
     } finally {
       if (!silent) {
         setBusyKey(null);
@@ -906,8 +1137,10 @@ const XboxCompanionContent: VFC = () => {
     setBusyKey("optimizations");
     try {
       setOptimizations(await getOptimizationStates());
+      setOptimizationsError(null);
     } catch (error) {
       console.error("Failed to refresh optimizations:", error);
+      setOptimizationsError(describeError(error));
     } finally {
       setBusyKey(null);
       setLoading(false);
@@ -918,8 +1151,10 @@ const XboxCompanionContent: VFC = () => {
     setBusyKey("information");
     try {
       setInformation(await getInformationState());
+      setInformationError(null);
     } catch (error) {
       console.error("Failed to refresh information:", error);
+      setInformationError(describeError(error));
     } finally {
       setBusyKey(null);
       setLoading(false);
@@ -948,6 +1183,7 @@ const XboxCompanionContent: VFC = () => {
       <OptimizationsView
         data={optimizations}
         loading={loading}
+        error={optimizationsError}
         busyKey={busyKey}
         onBack={() => setView("dashboard")}
         onRefresh={refreshOptimizations}
@@ -960,7 +1196,9 @@ const XboxCompanionContent: VFC = () => {
       <InformationView
         data={information}
         loading={loading}
+        error={informationError}
         onBack={() => setView("dashboard")}
+        onRefresh={refreshInformation}
       />
     );
   }
@@ -969,6 +1207,7 @@ const XboxCompanionContent: VFC = () => {
     <DashboardView
       data={dashboard}
       loading={loading}
+      error={dashboardError}
       busyKey={busyKey}
       onRefresh={refreshDashboard}
       onOpenOptimizations={() => {

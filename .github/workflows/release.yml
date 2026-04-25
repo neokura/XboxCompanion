@@ -41,19 +41,14 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
-      - name: Build frontend
-        run: pnpm run build
-
       - name: Package release zip
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
             VERSION="$(node -p "require('./package.json').version")"
           fi
+          ./release.sh "$VERSION"
           ZIP_NAME="xbox-companion-v${VERSION}.zip"
-          zip -r "$ZIP_NAME" dist main.py plugin.json package.json LICENSE README.md icons -x "*.DS_Store"
-          mkdir -p release
-          mv "$ZIP_NAME" release/
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
@@ -69,3 +64,4 @@ jobs:
         with:
           files: release/${{ env.ZIP_NAME }}
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

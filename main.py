@@ -7,24 +7,32 @@ Licensed under MIT
 
 import os
 import json
+import math
 import subprocess
 import shlex
 import glob
 import shutil
+import importlib
 
 import decky
 
 # Hardware paths. Vendor-specific paths are optional and features stay hidden
 # when the running handheld does not expose them.
 BATTERY_PATH = "/sys/class/power_supply/BAT0"
+BATTERY_PATH_GLOBS = [
+    "/sys/class/power_supply/BAT*",
+    "/sys/class/power_supply/CMB*",
+]
 DMI_PATH = "/sys/class/dmi/id"
 ALLY_LED_PATH = "/sys/class/leds/ally:rgb:joystick_rings"
 SMT_CONTROL_PATH = "/sys/devices/system/cpu/smt/control"
 
 RGB_LED_PATH_GLOBS = [
     "/sys/class/leds/*:rgb:joystick_rings",
+    "/sys/class/leds/*:rgb:*",
     "/sys/class/leds/*ally*rgb*",
     "/sys/class/leds/*legion*rgb*",
+    "/sys/class/leds/*legion*go*",
     "/sys/class/leds/*joystick*ring*",
 ]
 
@@ -96,6 +104,26 @@ FPS_NATIVE_PRESET_VALUES = [30, 40, 60]
 FPS_HIGH_REFRESH_MIN = 90
 FPS_OPTION_DISABLED = 0
 RGB_COLOR_PRESETS = ["#FF0000", "#00B7FF", "#00FF85", "#FFFFFF"]
+DEFAULT_COMMAND_TIMEOUT = 5
+
+LEGION_GO_S_HID = {
+    "name": "Legion Go S HID RGB",
+    "vid": 0x1A86,
+    "pids": [0xE310, 0xE311],
+    "usage_page": 0xFFA0,
+    "usage": 0x0001,
+    "interface": 3,
+    "protocol": "legion_go_s",
+}
+LEGION_GO_TABLET_HID = {
+    "name": "Legion Go HID RGB",
+    "vid": 0x17EF,
+    "pids": [0x6182, 0x6183, 0x6184, 0x6185, 0x61EB, 0x61EC, 0x61ED, 0x61EE],
+    "usage_page": 0xFFA0,
+    "usage": 0x0001,
+    "interface": None,
+    "protocol": "legion_go_tablet",
+}
 
 ATOMIC_UPDATE_DIR = "/etc/atomic-update.conf.d"
 
@@ -104,27 +132,36 @@ MEMORY_SYSCTL_PATH = "/etc/sysctl.d/99-xbox-companion-memory-tuning.conf"
 THP_TMPFILES_PATH = "/etc/tmpfiles.d/xbox-companion-thp.conf"
 NPU_BLACKLIST_PATH = "/etc/modprobe.d/blacklist-xbox-companion-npu.conf"
 USB_WAKE_SERVICE_PATH = "/etc/systemd/system/xbox-companion-disable-usb-wake.service"
-GRUB_HEALER_SCRIPT_PATH = "/etc/xbox-companion-grub-healer.sh"
-GRUB_HEALER_SERVICE_PATH = "/etc/systemd/system/xbox-companion-grub-healer.service"
 ATOMIC_MANIFEST_PATH = f"{ATOMIC_UPDATE_DIR}/xbox-companion.conf"
+OPTIMIZATION_STATE_PATH = "/var/lib/xbox-companion/optimization-state.json"
 LEGACY_ATOMIC_PATHS = [
     f"{ATOMIC_UPDATE_DIR}/xbox-companion-scx.conf",
     f"{ATOMIC_UPDATE_DIR}/xbox-companion-memory.conf",
     f"{ATOMIC_UPDATE_DIR}/xbox-companion-power.conf",
     f"{ATOMIC_UPDATE_DIR}/xbox-companion-grub-healer.conf",
 ]
+LEGACY_MANAGED_PATHS = [
+    "/etc/xbox-companion-grub-healer.sh",
+    "/etc/systemd/system/xbox-companion-grub-healer.service",
+]
 GRUB_DEFAULT_PATH = "/etc/default/grub"
 CPU_BOOST_PATH = "/sys/devices/system/cpu/cpufreq/boost"
 THP_ENABLED_PATH = "/sys/kernel/mm/transparent_hugepage/enabled"
+ACPI_WAKEUP_PATH = "/proc/acpi/wakeup"
+
+MEMORY_SYSCTL_VALUES = {
+    "vm.swappiness": "10",
+    "vm.min_free_kbytes": "524288",
+    "vm.dirty_ratio": "5",
+}
 
 SCX_DEFAULT_CONTENT = '''SCX_SCHEDULER="scx_lavd"
 SCX_FLAGS="--performance"
 '''
 
-MEMORY_SYSCTL_CONTENT = """vm.swappiness = 10
-vm.min_free_kbytes = 524288
-vm.dirty_ratio = 5
-"""
+MEMORY_SYSCTL_CONTENT = "".join(
+    f"{key} = {value}\n" for key, value in MEMORY_SYSCTL_VALUES.items()
+)
 
 THP_TMPFILES_CONTENT = (
     "w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise\n"
@@ -144,39 +181,38 @@ ExecStart=/bin/sh -c 'awk "$NF == \\"enabled\\" && ($1 ~ /^XHC/ || $1 ~ /^USB/) 
 WantedBy=multi-user.target
 """
 
-GRUB_KERNEL_PARAMS = [
-    "amd_pstate=active",
-    "amdgpu.abmlevel=0",
-    "split_lock_mitigate=0",
-    "nmi_watchdog=0",
-    "pcie_aspm=force",
-]
-
-GRUB_HEALER_SCRIPT_CONTENT = """#!/bin/bash
-set -e
-
-PARAMS="amd_pstate=active amdgpu.abmlevel=0 split_lock_mitigate=0 nmi_watchdog=0 pcie_aspm=force"
-if ! grep -q "amd_pstate=active" /proc/cmdline; then
-    sed -i 's/ amd_pstate=active amdgpu.abmlevel=0 split_lock_mitigate=0 nmi_watchdog=0 pcie_aspm=force//g' /etc/default/grub
-    sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\\"\\(.*\\)\\"/GRUB_CMDLINE_LINUX_DEFAULT=\\"\\1 $PARAMS\\"/" /etc/default/grub
-    update-grub
-    reboot
-fi
-"""
-
-GRUB_HEALER_SERVICE_CONTENT = """[Unit]
-Description=Xbox Companion - Auto-patch GRUB after SteamOS updates
-ConditionFileIsExecutable=/etc/xbox-companion-grub-healer.sh
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/etc/xbox-companion-grub-healer.sh
-
-[Install]
-WantedBy=multi-user.target
-"""
-
+GRUB_KERNEL_PARAM_OPTIONS = {
+    "kernel_amd_pstate": {
+        "param": "amd_pstate=active",
+        "name": "AMD P-State",
+        "description": "Forces the AMD P-State driver into active mode.",
+        "details": "Kernel parameter: amd_pstate=active",
+    },
+    "kernel_abm_off": {
+        "param": "amdgpu.abmlevel=0",
+        "name": "Disable ABM",
+        "description": "Disables AMD panel adaptive backlight modulation.",
+        "details": "Kernel parameter: amdgpu.abmlevel=0",
+    },
+    "kernel_split_lock": {
+        "param": "split_lock_mitigate=0",
+        "name": "Split Lock Mitigation",
+        "description": "Disables split lock mitigation for lower CPU overhead.",
+        "details": "Kernel parameter: split_lock_mitigate=0",
+    },
+    "kernel_watchdog": {
+        "param": "nmi_watchdog=0",
+        "name": "NMI Watchdog",
+        "description": "Disables the NMI watchdog to reduce background overhead.",
+        "details": "Kernel parameter: nmi_watchdog=0",
+    },
+    "kernel_aspm": {
+        "param": "pcie_aspm=force",
+        "name": "PCIe ASPM",
+        "description": "Forces PCIe active-state power management.",
+        "details": "Kernel parameter: pcie_aspm=force",
+    },
+}
 
 class SteamOsManagerClient:
     """Small DBus client for SteamOS Manager via busctl."""
@@ -630,6 +666,17 @@ class Plugin:
 
         return self.settings
 
+    def _save_settings(self):
+        try:
+            if not self.settings_path:
+                return
+            os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
+            with open(self.settings_path, "w") as f:
+                json.dump(self.settings, f, indent=2, sort_keys=True)
+                f.write("\n")
+        except Exception as e:
+            decky.logger.error(f"Failed to save settings: {e}")
+
     def _read_file(self, path: str, default: str = "Unknown") -> str:
         try:
             if os.path.exists(path):
@@ -656,7 +703,189 @@ class Plugin:
         return ""
 
     def _get_rgb_led_path(self) -> str:
-        return self._find_first_existing_path([ALLY_LED_PATH], RGB_LED_PATH_GLOBS)
+        candidates = []
+        if os.path.exists(ALLY_LED_PATH):
+            candidates.append(ALLY_LED_PATH)
+
+        for pattern in RGB_LED_PATH_GLOBS:
+            candidates.extend(sorted(glob.glob(pattern)))
+
+        seen = set()
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            if self._rgb_led_usable(path):
+                return path
+
+        return ""
+
+    def _hid_module(self):
+        for module_name in ("lib_hid", "hid"):
+            try:
+                return importlib.import_module(module_name)
+            except Exception:
+                continue
+        return None
+
+    def _hid_module_devices(self) -> list[dict]:
+        module = self._hid_module()
+        if module is None or not hasattr(module, "enumerate"):
+            return []
+        try:
+            return list(module.enumerate())
+        except Exception:
+            return []
+
+    def _hidraw_devices(self) -> list[dict]:
+        devices = []
+        for hidraw_path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+            uevent_path = os.path.join(hidraw_path, "device", "uevent")
+            dev_name = os.path.basename(hidraw_path)
+            dev_path = f"/dev/{dev_name}"
+            try:
+                values = {}
+                with open(uevent_path, "r") as f:
+                    for line in f:
+                        if "=" in line:
+                            key, value = line.strip().split("=", 1)
+                            values[key] = value
+                hid_id = values.get("HID_ID", "")
+                parts = hid_id.split(":")
+                if len(parts) < 3:
+                    continue
+                devices.append({
+                    "path": dev_path,
+                    "vendor_id": int(parts[-2], 16),
+                    "product_id": int(parts[-1], 16),
+                    "usage_page": None,
+                    "usage": None,
+                    "interface_number": None,
+                    "backend": "hidraw",
+                })
+            except Exception:
+                continue
+        return devices
+
+    def _normalize_hid_device(self, device: dict) -> dict:
+        return {
+            "path": device.get("path"),
+            "vendor_id": device.get("vendor_id"),
+            "product_id": device.get("product_id"),
+            "usage_page": device.get("usage_page"),
+            "usage": device.get("usage"),
+            "interface_number": device.get("interface_number"),
+            "backend": device.get("backend", "hid"),
+        }
+
+    def _legion_hid_candidates(self) -> list[dict]:
+        return [self._normalize_hid_device(device) for device in self._hid_module_devices()] + self._hidraw_devices()
+
+    def _hid_device_matches_config(self, device: dict, config: dict) -> bool:
+        if device.get("vendor_id") != config["vid"]:
+            return False
+        if device.get("product_id") not in config["pids"]:
+            return False
+        if config.get("interface") is not None and device.get("interface_number") is not None:
+            if device.get("interface_number") != config["interface"]:
+                return False
+        if device.get("usage_page") is not None and device.get("usage") is not None:
+            return device.get("usage_page") == config["usage_page"] and device.get("usage") == config["usage"]
+        return True
+
+    def _get_legion_hid_rgb_device(self) -> dict | None:
+        configs = [LEGION_GO_S_HID, LEGION_GO_TABLET_HID]
+        for config in configs:
+            for device in self._legion_hid_candidates():
+                if self._hid_device_matches_config(device, config):
+                    return {**device, "config": config}
+        return None
+
+    def _get_rgb_backend(self) -> dict:
+        led_path = self._get_rgb_led_path()
+        if led_path:
+            return {"type": "sysfs", "path": led_path, "details": "sysfs multicolor LED"}
+
+        device = self._get_legion_hid_rgb_device()
+        if device:
+            return {
+                "type": "legion_hid",
+                "device": device,
+                "details": device["config"]["name"],
+            }
+
+        return {"type": "none", "details": "RGB control unavailable"}
+
+    def _rgb_led_usable(self, led_path: str) -> bool:
+        return (
+            bool(led_path)
+            and os.path.exists(os.path.join(led_path, "brightness"))
+            and os.path.exists(os.path.join(led_path, "multi_intensity"))
+        )
+
+    def _get_battery_path(self) -> str:
+        direct_paths = [BATTERY_PATH]
+        for path in direct_paths:
+            if os.path.exists(path):
+                return path
+
+        candidates = []
+        for pattern in BATTERY_PATH_GLOBS:
+            candidates.extend(sorted(glob.glob(pattern)))
+
+        for path in candidates:
+            type_path = os.path.join(path, "type")
+            if self._read_file(type_path, "").lower() == "battery":
+                return path
+
+        return candidates[0] if candidates else ""
+
+    def _format_duration_hours(self, hours: float) -> str:
+        if not math.isfinite(hours) or hours <= 0:
+            return "Unknown"
+
+        total_minutes = max(1, int(round(hours * 60)))
+        whole_hours, minutes = divmod(total_minutes, 60)
+        if whole_hours == 0:
+            return f"{minutes}m"
+        if minutes == 0:
+            return f"{whole_hours}h"
+        return f"{whole_hours}h {minutes}m"
+
+    def _estimate_battery_times(self, battery: dict) -> tuple[str, str]:
+        voltage = float(battery.get("voltage", 0) or 0)
+        current = abs(float(battery.get("current", 0) or 0))
+        capacity = float(battery.get("capacity", 0) or 0)
+        full_capacity = float(
+            battery.get("full_capacity", 0)
+            or battery.get("design_capacity", 0)
+            or 0
+        )
+
+        if voltage <= 0 or current <= 0 or capacity <= 0 or full_capacity <= 0:
+            return "Unknown", "Unknown"
+
+        power = voltage * current
+        if power <= 0:
+            return "Unknown", "Unknown"
+
+        stored_energy = full_capacity * min(capacity, 100) / 100
+        target_percent = min(
+            max(float(battery.get("charge_limit", STEAMOS_CHARGE_FULL_PERCENT) or 0), 0),
+            100,
+        )
+        target_energy = full_capacity * target_percent / 100
+        status = str(battery.get("status", "") or "").strip().lower()
+
+        time_to_empty = "Unknown"
+        time_to_full = "Unknown"
+
+        if status == "discharging" and stored_energy > 0:
+            time_to_empty = self._format_duration_hours(stored_energy / power)
+        elif status == "charging" and target_energy > stored_energy:
+            time_to_full = self._format_duration_hours((target_energy - stored_energy) / power)
+
+        return time_to_empty, time_to_full
 
     def _get_os_release_values(self) -> dict:
         os_release = "/etc/os-release"
@@ -912,7 +1141,12 @@ class Plugin:
                             break
             
             # Get kernel version
-            result = subprocess.run(["uname", "-r"], capture_output=True, text=True)
+            result = subprocess.run(
+                ["uname", "-r"],
+                capture_output=True,
+                text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT,
+            )
             if result.returncode == 0:
                 info["kernel"] = result.stdout.strip()
             
@@ -951,7 +1185,8 @@ class Plugin:
         }
         
         try:
-            if not os.path.exists(BATTERY_PATH):
+            battery_path = self._get_battery_path()
+            if not battery_path:
                 return battery
             
             battery["present"] = True
@@ -968,7 +1203,7 @@ class Plugin:
             }
             
             for key, filename in battery_files.items():
-                filepath = os.path.join(BATTERY_PATH, filename)
+                filepath = os.path.join(battery_path, filename)
                 if os.path.exists(filepath):
                     with open(filepath, 'r') as f:
                         value = f.read().strip()
@@ -992,13 +1227,17 @@ class Plugin:
                 battery["health"] = round((battery["full_capacity"] / battery["design_capacity"]) * 100, 1)
             
             # Try to get temperature from ACPI
-            temp_path = os.path.join(BATTERY_PATH, "temp")
+            temp_path = os.path.join(battery_path, "temp")
             if os.path.exists(temp_path):
                 with open(temp_path, 'r') as f:
                     battery["temperature"] = int(f.read().strip()) / 10  # Convert to Celsius
 
             charge_limit_state = await self.get_charge_limit_state()
             battery["charge_limit"] = charge_limit_state.get("limit", battery["charge_limit"])
+            (
+                battery["time_to_empty"],
+                battery["time_to_full"],
+            ) = self._estimate_battery_times(battery)
             
         except Exception as e:
             decky.logger.error(f"Failed to get battery info: {e}")
@@ -1024,16 +1263,59 @@ class Plugin:
             r = int(rgb[0:2], 16)
             g = int(rgb[2:4], 16)
             b = int(rgb[4:6], 16)
-            color_int = (r << 16) | (g << 8) | b
+            values = self._rgb_multi_intensity_values(led_path, r, g, b)
 
             with open(multi_intensity_path, "w") as f:
-                f.write(f"{color_int} {color_int} {color_int} {color_int}")
+                f.write(" ".join(str(value) for value in values))
             with open(brightness_path, "w") as f:
                 f.write("255")
             return True
         except Exception as e:
             decky.logger.warning(f"Failed to apply RGB state: {e}")
             return False
+
+    def _rgb_multi_index_tokens(self, led_path: str) -> list[str]:
+        multi_index_path = os.path.join(led_path, "multi_index")
+        try:
+            if os.path.exists(multi_index_path):
+                with open(multi_index_path, "r") as f:
+                    return [token.strip().lower() for token in f.read().replace(",", " ").split()]
+        except Exception:
+            pass
+        return []
+
+    def _read_multi_intensity_values(self, led_path: str) -> list[int]:
+        multi_intensity_path = os.path.join(led_path, "multi_intensity")
+        try:
+            if os.path.exists(multi_intensity_path):
+                with open(multi_intensity_path, "r") as f:
+                    return [int(value) for value in f.read().split() if value.strip()]
+        except Exception:
+            pass
+        return []
+
+    def _rgb_multi_intensity_values(self, led_path: str, r: int, g: int, b: int) -> list[int]:
+        index_tokens = self._rgb_multi_index_tokens(led_path)
+        if index_tokens:
+            channel_values = {
+                "red": r,
+                "green": g,
+                "blue": b,
+                "white": 0,
+            }
+            values = [channel_values.get(token, 0) for token in index_tokens]
+            if any(values):
+                return values
+
+        current_values = self._read_multi_intensity_values(led_path)
+        if current_values and len(current_values) == 4 and max(current_values) > 255:
+            color_int = (r << 16) | (g << 8) | b
+            return [color_int] * len(current_values)
+
+        if current_values and len(current_values) % 3 == 0:
+            return [value for _ in range(len(current_values) // 3) for value in (r, g, b)]
+
+        return [r, g, b]
 
     def _read_rgb_state_from_led(self, led_path: str) -> tuple[bool, str]:
         enabled = False
@@ -1048,20 +1330,122 @@ class Plugin:
             enabled = False
 
         try:
-            multi_intensity_path = os.path.join(led_path, "multi_intensity")
-            if os.path.exists(multi_intensity_path):
-                with open(multi_intensity_path, "r") as f:
-                    values = [int(value) for value in f.read().split() if value.strip()]
-                if values:
-                    color_int = values[0]
-                    r = (color_int >> 16) & 0xFF
-                    g = (color_int >> 8) & 0xFF
-                    b = color_int & 0xFF
-                    color = f"#{r:02X}{g:02X}{b:02X}"
+            values = self._read_multi_intensity_values(led_path)
+            index_tokens = self._rgb_multi_index_tokens(led_path)
+            if values and index_tokens:
+                by_channel = dict(zip(index_tokens, values))
+                color = "#{:02X}{:02X}{:02X}".format(
+                    min(max(by_channel.get("red", 0), 0), 255),
+                    min(max(by_channel.get("green", 0), 0), 255),
+                    min(max(by_channel.get("blue", 0), 0), 255),
+                )
+            elif values and len(values) == 4 and max(values) > 255:
+                color_int = values[0]
+                r = (color_int >> 16) & 0xFF
+                g = (color_int >> 8) & 0xFF
+                b = color_int & 0xFF
+                color = f"#{r:02X}{g:02X}{b:02X}"
+            elif len(values) >= 3:
+                r, g, b = values[:3]
+                color = "#{:02X}{:02X}{:02X}".format(
+                    min(max(r, 0), 255),
+                    min(max(g, 0), 255),
+                    min(max(b, 0), 255),
+                )
         except Exception:
             color = RGB_COLOR_PRESETS[0]
 
         return enabled, color
+
+    def _legion_go_s_rgb_commands(self, color: str, enabled: bool) -> list[bytes]:
+        if not enabled:
+            return [bytes([0x04, 0x06, 0x00])]
+
+        r, g, b = self._hex_to_rgb(color)
+        profile = 3
+        brightness = 63
+        speed = 63
+        return [
+            bytes([0x04, 0x06, 0x01]),
+            bytes([0x10, 0x02, profile]),
+            bytes([0x10, profile + 2, 0x00, r, g, b, brightness, speed]),
+        ]
+
+    def _legion_go_tablet_rgb_commands(self, color: str, enabled: bool) -> list[bytes]:
+        def enable_command(controller: int, value: bool) -> bytes:
+            return bytes([0x05, 0x06, 0x70, 0x02, controller, 0x01 if value else 0x00, 0x01])
+
+        if not enabled:
+            return [enable_command(0x03, False), enable_command(0x04, False)]
+
+        r, g, b = self._hex_to_rgb(color)
+        profile = 3
+        brightness = 63
+        period = 0
+        commands = []
+        for controller in (0x03, 0x04):
+            commands.append(bytes([0x05, 0x0C, 0x72, 0x01, controller, 0x01, r, g, b, brightness, period, profile, 0x01]))
+        for controller in (0x03, 0x04):
+            commands.append(bytes([0x05, 0x06, 0x73, 0x02, controller, profile, 0x01]))
+        commands.extend([enable_command(0x03, True), enable_command(0x04, True)])
+        return commands
+
+    def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
+        rgb = color.lstrip("#")
+        return int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16)
+
+    def _legion_hid_rgb_commands(self, device: dict, color: str, enabled: bool) -> list[bytes]:
+        protocol = device["config"]["protocol"]
+        if protocol == "legion_go_s":
+            return self._legion_go_s_rgb_commands(color, enabled)
+        if protocol == "legion_go_tablet":
+            return self._legion_go_tablet_rgb_commands(color, enabled)
+        return []
+
+    def _open_hid_module_device(self, path):
+        module = self._hid_module()
+        if module is None:
+            return None
+        try:
+            if hasattr(module, "Device"):
+                return module.Device(path=path)
+            if hasattr(module, "device"):
+                device = module.device()
+                device.open_path(path)
+                return device
+        except Exception as e:
+            decky.logger.warning(f"Failed to open HID device: {e}")
+        return None
+
+    def _write_legion_hid_rgb(self, device: dict, color: str, enabled: bool) -> bool:
+        commands = self._legion_hid_rgb_commands(device, color, enabled)
+        if not commands:
+            return False
+
+        if device.get("backend") == "hidraw":
+            try:
+                with open(device["path"], "wb", buffering=0) as f:
+                    for command in commands:
+                        f.write(command)
+                return True
+            except Exception as e:
+                decky.logger.warning(f"Failed to write Legion HID raw RGB command: {e}")
+                return False
+
+        hid_device = self._open_hid_module_device(device.get("path"))
+        if hid_device is None:
+            return False
+
+        try:
+            for command in commands:
+                hid_device.write(command)
+            close = getattr(hid_device, "close", None)
+            if callable(close):
+                close()
+            return True
+        except Exception as e:
+            decky.logger.warning(f"Failed to write Legion HID RGB command: {e}")
+            return False
 
     async def get_rgb_state(self) -> dict:
         support = self._get_current_platform_support()
@@ -1074,14 +1458,21 @@ class Plugin:
                 "details": support.get("reason", "Platform is not supported"),
             }
 
-        led_path = self._get_rgb_led_path()
-        enabled, color = self._read_rgb_state_from_led(led_path) if led_path else (False, RGB_COLOR_PRESETS[0])
+        backend = self._get_rgb_backend()
+        if backend["type"] == "sysfs":
+            enabled, color = self._read_rgb_state_from_led(backend["path"])
+        elif backend["type"] == "legion_hid":
+            enabled = bool(self.settings.get("rgb_enabled", False))
+            color = self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+        else:
+            enabled, color = False, RGB_COLOR_PRESETS[0]
+
         return {
-            "available": bool(led_path),
+            "available": backend["type"] != "none",
             "enabled": enabled,
             "color": color,
             "presets": RGB_COLOR_PRESETS,
-            "details": "Simple RGB lighting control for compatible joystick rings",
+            "details": backend["details"],
         }
 
     async def set_rgb_enabled(self, enabled: bool) -> bool:
@@ -1090,16 +1481,24 @@ class Plugin:
             decky.logger.warning(support.get("reason", "Platform is not supported"))
             return False
 
-        led_path = self._get_rgb_led_path()
-        if not led_path:
+        backend = self._get_rgb_backend()
+        if backend["type"] == "none":
             decky.logger.warning("RGB control not available")
             return False
 
-        _current_enabled, current_color = self._read_rgb_state_from_led(led_path)
-        success = self._set_led_color(led_path, current_color, enabled)
+        if backend["type"] == "sysfs":
+            _current_enabled, current_color = self._read_rgb_state_from_led(backend["path"])
+            success = self._set_led_color(backend["path"], current_color, enabled)
+        else:
+            current_color = self.settings.get("rgb_color", RGB_COLOR_PRESETS[0])
+            success = self._write_legion_hid_rgb(backend["device"], current_color, enabled)
+
         if not success:
             return False
 
+        self.settings["rgb_enabled"] = enabled
+        self.settings["rgb_color"] = current_color
+        self._save_settings()
         return True
 
     async def set_rgb_color(self, color: str) -> bool:
@@ -1108,8 +1507,8 @@ class Plugin:
             decky.logger.warning(support.get("reason", "Platform is not supported"))
             return False
 
-        led_path = self._get_rgb_led_path()
-        if not led_path:
+        backend = self._get_rgb_backend()
+        if backend["type"] == "none":
             decky.logger.warning("RGB control not available")
             return False
 
@@ -1118,11 +1517,18 @@ class Plugin:
             decky.logger.warning(f"Unsupported RGB color preset: {color}")
             return False
 
-        enabled, _current_color = self._read_rgb_state_from_led(led_path)
-        success = self._set_led_color(led_path, normalized, enabled)
+        if backend["type"] == "sysfs":
+            enabled, _current_color = self._read_rgb_state_from_led(backend["path"])
+            success = self._set_led_color(backend["path"], normalized, enabled)
+        else:
+            enabled = bool(self.settings.get("rgb_enabled", False))
+            success = self._write_legion_hid_rgb(backend["device"], normalized, enabled)
+
         if not success:
             return False
 
+        self.settings["rgb_color"] = normalized
+        self._save_settings()
         return True
 
     def _command_exists(self, cmd: str) -> bool:
@@ -1146,6 +1552,10 @@ class Plugin:
         for path in LEGACY_ATOMIC_PATHS:
             self._remove_file(path)
 
+    def _cleanup_legacy_managed_files(self):
+        for path in LEGACY_MANAGED_PATHS:
+            self._remove_file(path)
+
     def _atomic_managed_entries(self) -> list[str]:
         checks = [
             (SCX_DEFAULT_PATH, ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"']),
@@ -1156,15 +1566,15 @@ class Plugin:
             (THP_TMPFILES_PATH, ["madvise"]),
             (NPU_BLACKLIST_PATH, ["blacklist amdxdna"]),
             (USB_WAKE_SERVICE_PATH, ["Xbox Companion - Block USB Wake"]),
-            (
-                GRUB_HEALER_SCRIPT_PATH,
-                ["amd_pstate=active", "amdgpu.abmlevel=0", "pcie_aspm=force"],
-            ),
-            (GRUB_HEALER_SERVICE_PATH, ["Xbox Companion - Auto-patch GRUB"]),
         ]
-        return [path for path, needles in checks if self._file_contains_all(path, needles)]
+        entries = [path for path, needles in checks if self._file_contains_all(path, needles)]
+        kernel_params = self._managed_kernel_params()
+        if kernel_params and self._file_contains_any(GRUB_DEFAULT_PATH, kernel_params):
+            entries.append(GRUB_DEFAULT_PATH)
+        return entries
 
     def _refresh_atomic_manifest(self):
+        self._cleanup_legacy_managed_files()
         entries = self._atomic_managed_entries()
         if entries:
             content = "\n".join(entries) + "\n"
@@ -1248,6 +1658,35 @@ class Plugin:
             return error
         return ""
 
+    def _read_optimization_state(self) -> dict:
+        try:
+            if not os.path.exists(OPTIMIZATION_STATE_PATH):
+                return {}
+            with open(OPTIMIZATION_STATE_PATH, "r") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            decky.logger.warning(f"Failed to read optimization state: {e}")
+            return {}
+
+    def _write_optimization_state(self, state: dict):
+        try:
+            if not state:
+                self._remove_file(OPTIMIZATION_STATE_PATH)
+                return
+            os.makedirs(os.path.dirname(OPTIMIZATION_STATE_PATH), exist_ok=True)
+            with open(OPTIMIZATION_STATE_PATH, "w") as f:
+                json.dump(state, f, indent=2, sort_keys=True)
+                f.write("\n")
+        except Exception as e:
+            decky.logger.warning(f"Failed to write optimization state: {e}")
+
+    def _pop_optimization_state_value(self, key: str):
+        state = self._read_optimization_state()
+        value = state.pop(key, None)
+        self._write_optimization_state(state)
+        return value
+
     def _get_fps_presets(self) -> list[int]:
         presets = list(FPS_NATIVE_PRESET_VALUES)
         presets.extend(self._get_supported_high_refresh_rates())
@@ -1282,12 +1721,28 @@ class Plugin:
     def _systemctl(self, *args: str) -> str:
         return self._run_optional_command(["systemctl", *args])
 
+    def _service_exists(self, service: str) -> bool:
+        if os.path.exists(f"/etc/systemd/system/{service}") or os.path.exists(f"/usr/lib/systemd/system/{service}"):
+            return True
+
+        try:
+            result = subprocess.run(
+                ["systemctl", "list-unit-files", service, "--no-legend"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0 and service in result.stdout
+        except Exception:
+            return False
+
     def _service_enabled(self, service: str) -> bool:
         try:
             result = subprocess.run(
                 ["systemctl", "is-enabled", service],
                 capture_output=True,
                 text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT,
             )
             return result.returncode == 0 and result.stdout.strip() == "enabled"
         except Exception:
@@ -1299,6 +1754,7 @@ class Plugin:
                 ["systemctl", "is-active", service],
                 capture_output=True,
                 text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT,
             )
             return result.returncode == 0 and result.stdout.strip() == "active"
         except Exception:
@@ -1309,10 +1765,14 @@ class Plugin:
             ["sysctl", "-n", key],
             capture_output=True,
             text=True,
+            timeout=DEFAULT_COMMAND_TIMEOUT,
         )
         if result.returncode != 0:
             return ""
         return result.stdout.strip()
+
+    def _write_sysctl(self, key: str, value: str):
+        self._run_optional_command(["sysctl", "-w", f"{key}={value}"])
 
     def _file_contains_all(self, path: str, needles: list[str]) -> bool:
         try:
@@ -1324,8 +1784,68 @@ class Plugin:
         except Exception:
             return False
 
+    def _file_contains_any(self, path: str, needles: list[str]) -> bool:
+        try:
+            if not os.path.exists(path):
+                return False
+            with open(path, "r") as f:
+                contents = f.read()
+            return any(needle in contents for needle in needles)
+        except Exception:
+            return False
+
     def _is_amd_platform(self) -> bool:
         return "AMD" in self._read_file("/proc/cpuinfo", "").upper()
+
+    def _amd_npu_present(self) -> bool:
+        if os.path.exists("/sys/module/amdxdna"):
+            return True
+
+        for device in glob.glob("/sys/bus/pci/devices/*"):
+            module_path = os.path.join(device, "driver", "module")
+            try:
+                if os.path.basename(os.path.realpath(module_path)) == "amdxdna":
+                    return True
+            except Exception:
+                continue
+
+        if self._command_exists("lspci"):
+            success, output = self._run_command_output(["lspci", "-nn"])
+            if success:
+                normalized = output.upper()
+                return "XDNA" in normalized or "NPU" in normalized or "AI ENGINE" in normalized
+
+        return False
+
+    def _usb_wake_control_available(self) -> bool:
+        return os.path.exists(ACPI_WAKEUP_PATH) and self._command_exists("systemctl")
+
+    def _read_cmdline(self) -> str:
+        try:
+            with open("/proc/cmdline", "r") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    def _read_acpi_wake_enabled_devices(self) -> list[str]:
+        try:
+            with open(ACPI_WAKEUP_PATH, "r") as f:
+                devices = []
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[2] == "*enabled" and (parts[0].startswith("XHC") or parts[0].startswith("USB")):
+                        devices.append(parts[0])
+                return devices
+        except Exception:
+            return []
+
+    def _set_acpi_wake_devices(self, devices: list[str]):
+        for device in devices:
+            try:
+                with open(ACPI_WAKEUP_PATH, "w") as f:
+                    f.write(device)
+            except Exception as e:
+                decky.logger.warning(f"Failed to restore ACPI wake device {device}: {e}")
 
     def _thp_is_madvise(self) -> bool:
         try:
@@ -1336,18 +1856,66 @@ class Plugin:
         except Exception:
             return False
 
-    def _kernel_params_active(self) -> bool:
+    def _read_thp_mode(self) -> str:
         try:
-            with open("/proc/cmdline", "r") as f:
-                cmdline = f.read()
-            return all(param in cmdline for param in GRUB_KERNEL_PARAMS)
+            if not os.path.exists(THP_ENABLED_PATH):
+                return ""
+            with open(THP_ENABLED_PATH, "r") as f:
+                for token in f.read().split():
+                    if token.startswith("[") and token.endswith("]"):
+                        return token.strip("[]")
         except Exception:
+            return ""
+        return ""
+
+    def _write_thp_mode(self, mode: str):
+        if not mode:
+            return
+        try:
+            with open(THP_ENABLED_PATH, "w") as f:
+                f.write(mode)
+        except Exception as e:
+            decky.logger.warning(f"Failed to set THP mode {mode}: {e}")
+
+    def _kernel_param_active(self, param: str) -> bool:
+        return param in self._read_cmdline()
+
+    def _grub_param_configured(self, param: str) -> bool:
+        return self._file_contains_all(GRUB_DEFAULT_PATH, [param])
+
+    def _managed_kernel_params(self) -> list[str]:
+        params = self._read_optimization_state().get("kernel_params", {})
+        if not isinstance(params, dict):
+            return []
+        known_params = {option["param"] for option in GRUB_KERNEL_PARAM_OPTIONS.values()}
+        return [param for param in params if param in known_params]
+
+    def _kernel_param_managed(self, param: str) -> bool:
+        return param in self._managed_kernel_params()
+
+    def _remember_kernel_param_state(self, param: str, was_configured: bool):
+        state = self._read_optimization_state()
+        params = state.get("kernel_params", {})
+        if not isinstance(params, dict):
+            params = {}
+        params.setdefault(param, {"was_configured": was_configured})
+        state["kernel_params"] = params
+        self._write_optimization_state(state)
+
+    def _forget_kernel_param_state(self, param: str) -> bool:
+        state = self._read_optimization_state()
+        params = state.get("kernel_params", {})
+        if not isinstance(params, dict):
             return False
+        data = params.pop(param, {})
+        if params:
+            state["kernel_params"] = params
+        else:
+            state.pop("kernel_params", None)
+        self._write_optimization_state(state)
+        return isinstance(data, dict) and data.get("was_configured", False)
 
-    def _grub_params_configured(self) -> bool:
-        return self._file_contains_all(GRUB_DEFAULT_PATH, GRUB_KERNEL_PARAMS)
-
-    def _update_grub_params(self, enabled: bool) -> str:
+    def _update_grub_param(self, param: str, enabled: bool) -> str:
         if not os.path.exists(GRUB_DEFAULT_PATH):
             return "GRUB config not found"
 
@@ -1355,30 +1923,29 @@ class Plugin:
             with open(GRUB_DEFAULT_PATH, "r") as f:
                 contents = f.read()
 
-            params = " ".join(GRUB_KERNEL_PARAMS)
             lines = []
             changed = False
-
             for line in contents.splitlines():
                 if line.startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
                     prefix, value = line.split("=", 1)
-                    quote = '"' if value.startswith('"') else ""
-                    raw = value.strip('"')
-                    parts = [part for part in raw.split() if part not in GRUB_KERNEL_PARAMS]
+                    raw = value.strip().strip('"').strip("'")
+                    parts = [part for part in raw.split() if part != param]
 
                     if enabled:
-                        parts.extend(param for param in GRUB_KERNEL_PARAMS if param not in parts)
+                        parts.append(param)
 
                     new_value = " ".join(parts).strip()
-                    line = f'{prefix}="{new_value}"' if quote else f"{prefix}={new_value}"
+                    line = f'{prefix}="{new_value}"'
                     changed = True
                 lines.append(line)
 
             if not changed and enabled:
-                lines.append(f'GRUB_CMDLINE_LINUX_DEFAULT="{params}"')
+                lines.append(f'GRUB_CMDLINE_LINUX_DEFAULT="{param}"')
 
             with open(GRUB_DEFAULT_PATH, "w") as f:
                 f.write("\n".join(lines) + "\n")
+
+            self._refresh_atomic_manifest()
 
             if self._command_exists("update-grub"):
                 return self._run_optional_command(["update-grub"])
@@ -1440,86 +2007,108 @@ class Plugin:
             "Switch SteamOS scheduling to scx_lavd for smoother frame delivery.",
             enabled,
             service_active,
-            available=self._command_exists("systemctl"),
-            details="Configured" if configured else "Not configured",
+            available=self._command_exists("systemctl") and self._service_exists("scx.service"),
+            details="SteamOS scx.service" if self._service_exists("scx.service") else "scx.service unavailable",
             risk_note="Touches a system service.",
         )
 
-    def _get_memory_state(self) -> dict:
+    def _get_swap_protect_state(self) -> dict:
         configured = self._file_contains_all(
             MEMORY_SYSCTL_PATH,
             ["vm.swappiness = 10", "vm.min_free_kbytes = 524288", "vm.dirty_ratio = 5"],
         )
-        thp_configured = self._file_contains_all(THP_TMPFILES_PATH, ["madvise"])
-        atomic = self._atomic_manifest_contains(
-            [MEMORY_SYSCTL_PATH, THP_TMPFILES_PATH],
-        )
-        enabled = configured and thp_configured and atomic
+        atomic = self._atomic_manifest_contains([MEMORY_SYSCTL_PATH])
+        enabled = configured and atomic
         runtime = (
-            self._read_sysctl("vm.swappiness") == "10"
-            and self._read_sysctl("vm.min_free_kbytes") == "524288"
-            and self._read_sysctl("vm.dirty_ratio") == "5"
-            and self._thp_is_madvise()
+            self._read_sysctl("vm.swappiness") == MEMORY_SYSCTL_VALUES["vm.swappiness"]
+            and self._read_sysctl("vm.min_free_kbytes") == MEMORY_SYSCTL_VALUES["vm.min_free_kbytes"]
+            and self._read_sysctl("vm.dirty_ratio") == MEMORY_SYSCTL_VALUES["vm.dirty_ratio"]
         )
 
         return self._optimization_state(
-            "memory",
-            "Memory + THP",
-            "Applies memory sysctl tuning and sets Transparent Huge Pages to madvise.",
+            "swap_protect",
+            "Swap Protection",
+            "Applies conservative memory sysctl tuning for smoother pressure handling.",
             enabled,
             runtime,
-            available=self._command_exists("sysctl") and os.path.exists(THP_ENABLED_PATH),
+            available=self._command_exists("sysctl"),
             needs_reboot=(enabled and not runtime) or (not enabled and runtime),
-            details="swappiness 10, THP madvise",
-            risk_note="Some changes only fully settle after reboot.",
+            details="swappiness 10, min_free_kbytes 524288, dirty_ratio 5",
+            risk_note="Runtime sysctl values may remain until they are reloaded.",
         )
 
-    def _get_power_state(self) -> dict:
-        npu_configured = self._file_contains_all(NPU_BLACKLIST_PATH, ["blacklist amdxdna"])
-        service_configured = os.path.exists(USB_WAKE_SERVICE_PATH)
-        atomic = self._atomic_manifest_contains(
-            [NPU_BLACKLIST_PATH, USB_WAKE_SERVICE_PATH],
+    def _get_thp_madvise_state(self) -> dict:
+        configured = self._file_contains_all(THP_TMPFILES_PATH, ["madvise"])
+        atomic = self._atomic_manifest_contains([THP_TMPFILES_PATH])
+        enabled = configured and atomic
+        runtime = self._thp_is_madvise()
+
+        return self._optimization_state(
+            "thp_madvise",
+            "THP Madvise",
+            "Sets Transparent Huge Pages to madvise.",
+            enabled,
+            runtime,
+            available=os.path.exists(THP_ENABLED_PATH),
+            needs_reboot=(enabled and not runtime) or (not enabled and runtime),
+            details="Transparent Huge Pages mode: madvise",
+            risk_note="Some games prefer different THP behavior.",
         )
+
+    def _get_npu_blacklist_state(self) -> dict:
+        configured = self._file_contains_all(NPU_BLACKLIST_PATH, ["blacklist amdxdna"])
+        atomic = self._atomic_manifest_contains([NPU_BLACKLIST_PATH])
+        enabled = configured and atomic
+        module_loaded = os.path.exists("/sys/module/amdxdna")
+        npu_present = self._amd_npu_present()
+
+        return self._optimization_state(
+            "npu_blacklist",
+            "NPU Blacklist",
+            "Blacklists the AMD NPU module on handhelds that expose an AMD XDNA NPU.",
+            enabled,
+            enabled and not module_loaded,
+            available=self._is_amd_platform() and (npu_present or configured),
+            needs_reboot=enabled and module_loaded,
+            details="Module: amdxdna",
+            risk_note="Requires reboot when the module is already loaded.",
+        )
+
+    def _get_usb_wake_state(self) -> dict:
+        service_configured = os.path.exists(USB_WAKE_SERVICE_PATH)
+        atomic = self._atomic_manifest_contains([USB_WAKE_SERVICE_PATH])
         service_enabled = self._service_enabled("xbox-companion-disable-usb-wake.service")
         service_active = self._service_active("xbox-companion-disable-usb-wake.service")
-        enabled = npu_configured and service_configured and atomic and service_enabled
+        enabled = service_configured and atomic and service_enabled
 
         return self._optimization_state(
-            "power",
-            "NPU + USB Wake",
-            "Disables background wake sources and blacklists the AMD NPU module.",
+            "usb_wake",
+            "USB Wake Guard",
+            "Disables USB wake sources that can wake the handheld unexpectedly.",
             enabled,
             service_active,
-            available=self._command_exists("systemctl") and self._is_amd_platform(),
-            needs_reboot=enabled and os.path.exists("/sys/module/amdxdna"),
-            details="NPU blacklist, USB wake service",
-            risk_note="Touches a boot module and a system service.",
+            available=self._usb_wake_control_available(),
+            details="Uses /proc/acpi/wakeup through a systemd service",
+            risk_note="Touches a system service.",
         )
 
-    def _get_grub_healer_state(self) -> dict:
-        script_configured = self._file_contains_all(
-            GRUB_HEALER_SCRIPT_PATH,
-            ["amd_pstate=active", "amdgpu.abmlevel=0", "pcie_aspm=force"],
-        )
-        service_configured = os.path.exists(GRUB_HEALER_SERVICE_PATH)
-        atomic = self._atomic_manifest_contains(
-            [GRUB_HEALER_SCRIPT_PATH, GRUB_HEALER_SERVICE_PATH],
-        )
-        service_enabled = self._service_enabled("xbox-companion-grub-healer.service")
-        configured = script_configured and service_configured and atomic and service_enabled
-        enabled = configured and self._grub_params_configured()
-        active = self._kernel_params_active()
+    def _get_kernel_param_state(self, key: str, option: dict) -> dict:
+        param = option["param"]
+        configured = self._grub_param_configured(param)
+        atomic = self._atomic_manifest_contains([GRUB_DEFAULT_PATH])
+        enabled = configured and atomic and self._kernel_param_managed(param)
+        active = self._kernel_param_active(param)
 
         return self._optimization_state(
-            "grub_healer",
-            "Kernel Params",
-            "Maintains recommended kernel parameters after SteamOS updates.",
+            key,
+            option["name"],
+            option["description"],
             enabled,
             active,
             available=os.path.exists(GRUB_DEFAULT_PATH) and self._is_amd_platform(),
             needs_reboot=(enabled and not active) or (not enabled and active),
-            details="amd_pstate, ABM off, ASPM",
-            risk_note="Modifies boot configuration.",
+            details=option["details"],
+            risk_note="Modifies boot configuration and requires reboot to become active.",
         )
 
     async def get_optimization_states(self) -> dict:
@@ -1542,14 +2131,46 @@ class Plugin:
 
         states = [
             self._get_lavd_state(),
-            self._get_memory_state(),
-            self._get_power_state(),
-            self._get_grub_healer_state(),
+            self._get_swap_protect_state(),
+            self._get_thp_madvise_state(),
+            self._get_npu_blacklist_state(),
+            self._get_usb_wake_state(),
         ]
+        states.extend(
+            self._get_kernel_param_state(key, option)
+            for key, option in GRUB_KERNEL_PARAM_OPTIONS.items()
+        )
 
         return {
             "states": states,
         }
+
+    def _optimization_handlers(self) -> dict:
+        handlers = {
+            "lavd": self._set_lavd_enabled,
+            "swap_protect": self._set_swap_protect_enabled,
+            "thp_madvise": self._set_thp_madvise_enabled,
+            "npu_blacklist": self._set_npu_blacklist_enabled,
+            "usb_wake": self._set_usb_wake_enabled,
+        }
+        for param_key, option in GRUB_KERNEL_PARAM_OPTIONS.items():
+            handlers[param_key] = lambda value, selected=option["param"]: self._set_kernel_param_enabled(selected, value)
+        return handlers
+
+    def _optimization_state_readers(self) -> dict:
+        states = {
+            "lavd": self._get_lavd_state,
+            "swap_protect": self._get_swap_protect_state,
+            "thp_madvise": self._get_thp_madvise_state,
+            "npu_blacklist": self._get_npu_blacklist_state,
+            "usb_wake": self._get_usb_wake_state,
+        }
+        for param_key, option in GRUB_KERNEL_PARAM_OPTIONS.items():
+            states[param_key] = lambda selected_key=param_key, selected_option=option: self._get_kernel_param_state(
+                selected_key,
+                selected_option,
+            )
+        return states
 
     async def set_optimization_enabled(self, key: str, enabled: bool) -> bool:
         try:
@@ -1558,18 +2179,8 @@ class Plugin:
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
                 return False
 
-            handlers = {
-                "lavd": self._set_lavd_enabled,
-                "memory": self._set_memory_enabled,
-                "power": self._set_power_enabled,
-                "grub_healer": self._set_grub_healer_enabled,
-            }
-            states = {
-                "lavd": self._get_lavd_state,
-                "memory": self._get_memory_state,
-                "power": self._get_power_state,
-                "grub_healer": self._get_grub_healer_state,
-            }
+            handlers = self._optimization_handlers()
+            states = self._optimization_state_readers()
 
             handler = handlers.get(key)
             state_reader = states.get(key)
@@ -1577,17 +2188,90 @@ class Plugin:
                 decky.logger.error(f"Unknown optimization: {key}")
                 return False
 
+            before = state_reader()
+            if not before.get("available", True):
+                decky.logger.warning(f"Optimization unavailable: {key}")
+                return False
+
             handler(enabled)
             state = state_reader()
             if enabled:
                 return state.get("enabled", False)
-            return not state.get("enabled", False) and not state.get("active", False)
+            return not state.get("enabled", False)
         except Exception as e:
             decky.logger.error(f"Failed to toggle optimization {key}: {e}")
             return False
 
+    async def enable_available_optimizations(self) -> dict:
+        result = {
+            "success": False,
+            "enabled": [],
+            "already_enabled": [],
+            "skipped": [],
+            "failed": [],
+        }
+
+        try:
+            support = self._get_current_platform_support()
+            if not support.get("supported", False):
+                result["skipped"].append({
+                    "key": "platform_guard",
+                    "name": "Platform Guard",
+                    "reason": support.get("reason", "Platform is not supported"),
+                })
+                return result
+
+            handlers = self._optimization_handlers()
+            states = (await self.get_optimization_states()).get("states", [])
+
+            for state in states:
+                key = state.get("key", "")
+                name = state.get("name", key)
+
+                if key not in handlers:
+                    continue
+
+                if not state.get("available", False):
+                    result["skipped"].append({
+                        "key": key,
+                        "name": name,
+                        "reason": state.get("details") or state.get("status", "unavailable"),
+                    })
+                    continue
+
+                if state.get("enabled", False):
+                    result["already_enabled"].append({"key": key, "name": name})
+                    continue
+
+                success = await self.set_optimization_enabled(key, True)
+                if success:
+                    result["enabled"].append({"key": key, "name": name})
+                else:
+                    result["failed"].append({"key": key, "name": name})
+
+            result["success"] = len(result["failed"]) == 0
+            return result
+        except Exception as e:
+            decky.logger.error(f"Failed to enable available optimizations: {e}")
+            result["failed"].append({"key": "bulk_enable", "name": "Enable Available", "reason": str(e)})
+            return result
+
     def _set_lavd_enabled(self, enabled: bool):
         if enabled:
+            state = self._read_optimization_state()
+            if "lavd_previous_content" not in state:
+                previous_content = None
+                if os.path.exists(SCX_DEFAULT_PATH) and not self._file_contains_all(
+                    SCX_DEFAULT_PATH,
+                    ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"'],
+                ):
+                    try:
+                        with open(SCX_DEFAULT_PATH, "r") as f:
+                            previous_content = f.read()
+                    except Exception:
+                        previous_content = None
+                state["lavd_previous_content"] = previous_content
+                self._write_optimization_state(state)
             self._write_managed_file(SCX_DEFAULT_PATH, SCX_DEFAULT_CONTENT)
             self._refresh_atomic_manifest()
             if self._command_exists("steamosctl"):
@@ -1595,73 +2279,115 @@ class Plugin:
             self._systemctl("enable", "--now", "scx.service")
         else:
             self._systemctl("disable", "--now", "scx.service")
-            removed_files = []
-            skipped_files = []
-            errors = []
-            self._remove_managed_file(
-                SCX_DEFAULT_PATH,
-                removed_files,
-                skipped_files,
-                errors,
-                ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"'],
-            )
-            for error in errors:
-                decky.logger.warning(f"Failed to clean LAVD file: {error}")
+            previous_content = self._pop_optimization_state_value("lavd_previous_content")
+            if isinstance(previous_content, str):
+                self._write_managed_file(SCX_DEFAULT_PATH, previous_content)
+            else:
+                removed_files = []
+                skipped_files = []
+                errors = []
+                self._remove_managed_file(
+                    SCX_DEFAULT_PATH,
+                    removed_files,
+                    skipped_files,
+                    errors,
+                    ['SCX_SCHEDULER="scx_lavd"', 'SCX_FLAGS="--performance"'],
+                )
+                for error in errors:
+                    decky.logger.warning(f"Failed to clean LAVD file: {error}")
             self._refresh_atomic_manifest()
 
-    def _set_memory_enabled(self, enabled: bool):
+    def _set_swap_protect_enabled(self, enabled: bool):
         if enabled:
+            state = self._read_optimization_state()
+            state.setdefault(
+                "swap_protect_previous",
+                {key: self._read_sysctl(key) for key in MEMORY_SYSCTL_VALUES},
+            )
+            self._write_optimization_state(state)
             self._write_managed_file(MEMORY_SYSCTL_PATH, MEMORY_SYSCTL_CONTENT)
-            self._write_managed_file(THP_TMPFILES_PATH, THP_TMPFILES_CONTENT)
             self._refresh_atomic_manifest()
             self._run_optional_command(["sysctl", "--system"])
-            self._run_optional_command(["systemd-tmpfiles", "--create", THP_TMPFILES_PATH])
         else:
             self._remove_file(MEMORY_SYSCTL_PATH)
+            self._refresh_atomic_manifest()
+            previous = self._pop_optimization_state_value("swap_protect_previous")
+            if isinstance(previous, dict):
+                for key, value in previous.items():
+                    if value:
+                        self._write_sysctl(key, str(value))
+            else:
+                self._run_optional_command(["sysctl", "--system"])
+
+    def _set_thp_madvise_enabled(self, enabled: bool):
+        if enabled:
+            state = self._read_optimization_state()
+            state.setdefault("thp_previous_mode", self._read_thp_mode())
+            self._write_optimization_state(state)
+            self._write_managed_file(THP_TMPFILES_PATH, THP_TMPFILES_CONTENT)
+            self._refresh_atomic_manifest()
+            self._run_optional_command(["systemd-tmpfiles", "--create", THP_TMPFILES_PATH])
+        else:
             self._remove_file(THP_TMPFILES_PATH)
             self._refresh_atomic_manifest()
-            self._run_optional_command(["sysctl", "--system"])
-            self._run_optional_command(["systemd-tmpfiles", "--create"])
+            previous_mode = self._pop_optimization_state_value("thp_previous_mode")
+            if isinstance(previous_mode, str) and previous_mode:
+                self._write_thp_mode(previous_mode)
+            else:
+                self._run_optional_command(["systemd-tmpfiles", "--create"])
 
-    def _set_power_enabled(self, enabled: bool):
-        if enabled and not self._is_amd_platform():
-            decky.logger.warning("Power optimization requires an AMD platform")
+    def _set_npu_blacklist_enabled(self, enabled: bool):
+        if enabled and not (self._is_amd_platform() and self._amd_npu_present()):
+            decky.logger.warning("NPU blacklist requires a detected AMD NPU")
+            return
+
+        if enabled:
+            self._write_managed_file(NPU_BLACKLIST_PATH, NPU_BLACKLIST_CONTENT)
+        else:
+            self._remove_file(NPU_BLACKLIST_PATH)
+        self._refresh_atomic_manifest()
+
+    def _set_usb_wake_enabled(self, enabled: bool):
+        if enabled and not self._usb_wake_control_available():
+            decky.logger.warning("USB wake guard requires ACPI wake controls and systemctl")
             return
 
         service_name = "xbox-companion-disable-usb-wake.service"
         if enabled:
-            self._write_managed_file(NPU_BLACKLIST_PATH, NPU_BLACKLIST_CONTENT)
+            state = self._read_optimization_state()
+            state.setdefault("usb_wake_enabled_devices", self._read_acpi_wake_enabled_devices())
+            self._write_optimization_state(state)
             self._write_managed_file(USB_WAKE_SERVICE_PATH, USB_WAKE_SERVICE_CONTENT)
             self._refresh_atomic_manifest()
             self._systemctl("daemon-reload")
             self._systemctl("enable", "--now", service_name)
         else:
             self._systemctl("disable", "--now", service_name)
-            self._remove_file(NPU_BLACKLIST_PATH)
             self._remove_file(USB_WAKE_SERVICE_PATH)
             self._refresh_atomic_manifest()
             self._systemctl("daemon-reload")
+            previous_devices = self._pop_optimization_state_value("usb_wake_enabled_devices")
+            if isinstance(previous_devices, list):
+                self._set_acpi_wake_devices([str(device) for device in previous_devices])
 
-    def _set_grub_healer_enabled(self, enabled: bool):
+    def _set_kernel_param_enabled(self, param: str, enabled: bool):
         if enabled and not self._is_amd_platform():
             decky.logger.warning("Kernel parameter optimization requires an AMD platform")
             return
 
-        service_name = "xbox-companion-grub-healer.service"
         if enabled:
-            self._write_managed_file(GRUB_HEALER_SCRIPT_PATH, GRUB_HEALER_SCRIPT_CONTENT, 0o755)
-            self._write_managed_file(GRUB_HEALER_SERVICE_PATH, GRUB_HEALER_SERVICE_CONTENT)
+            self._remember_kernel_param_state(param, self._grub_param_configured(param))
+            self._update_grub_param(param, True)
+            return
+
+        was_configured = self._forget_kernel_param_state(param)
+        if was_configured:
             self._refresh_atomic_manifest()
-            self._update_grub_params(True)
-            self._systemctl("daemon-reload")
-            self._systemctl("enable", service_name)
-        else:
-            self._systemctl("disable", "--now", service_name)
-            self._update_grub_params(False)
-            self._remove_file(GRUB_HEALER_SCRIPT_PATH)
-            self._remove_file(GRUB_HEALER_SERVICE_PATH)
-            self._refresh_atomic_manifest()
-            self._systemctl("daemon-reload")
+            if self._command_exists("update-grub"):
+                self._run_optional_command(["update-grub"])
+            return
+
+        self._update_grub_param(param, False)
 
     async def get_performance_profiles(self) -> dict:
         support = self._get_current_platform_support()
@@ -2073,7 +2799,7 @@ class Plugin:
             "smt_available": smt.get("available", False),
             "smt_status": smt.get("status", ""),
             "smt_details": smt.get("details", ""),
-            "boost_enabled": True,
+            "boost_enabled": False,
             "boost_available": os.path.exists(CPU_BOOST_PATH)
         }
         

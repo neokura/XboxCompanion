@@ -1,14 +1,15 @@
 #!/bin/bash
 # Xbox Companion - Installation Script
 # Author: neokura
-set -e
+set -euo pipefail
 
 PLUGIN_NAME="Xbox Companion"
+PLUGIN_SLUG="xbox-companion"
 PLUGIN_DIR="$HOME/homebrew/plugins/$PLUGIN_NAME"
 REPO_OWNER="neokura"
 REPO_NAME="XboxCompanion"
+REQUESTED_VERSION="${1:-${XBOX_COMPANION_VERSION:-}}"
 
-# Trap to ensure cleanup on exit
 TEMP_FILES=()
 cleanup() {
     if [ ${#TEMP_FILES[@]} -gt 0 ]; then
@@ -20,19 +21,115 @@ cleanup() {
 }
 trap cleanup EXIT
 
+require_command() {
+    local cmd="$1"
+    local description="$2"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: $description is required but '$cmd' is not installed."
+        exit 1
+    fi
+}
+
+fetch_release_metadata() {
+    python3 - "$REPO_OWNER" "$REPO_NAME" "$REQUESTED_VERSION" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+owner, repo, requested = sys.argv[1:4]
+headers = {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "XboxCompanionInstaller/1.0",
+}
+
+urls = []
+if requested:
+    urls.append(f"https://api.github.com/repos/{owner}/{repo}/releases/tags/v{requested}")
+urls.append(f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=20")
+
+def open_json(url: str):
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+last_error = ""
+for url in urls:
+    try:
+        payload = open_json(url)
+    except urllib.error.HTTPError as exc:
+        last_error = f"GitHub API error: HTTP {exc.code}"
+        continue
+    except Exception as exc:
+        last_error = str(exc)
+        continue
+
+    releases = payload if isinstance(payload, list) else [payload]
+    for release in releases:
+        tag_name = str(release.get("tag_name", "") or "")
+        if requested and tag_name != f"v{requested}":
+            continue
+
+        for asset in release.get("assets") or []:
+            asset_url = str(asset.get("browser_download_url", "") or "")
+            if not asset_url.endswith(".zip"):
+                continue
+
+            version = tag_name[1:] if tag_name.startswith("v") else tag_name
+            print(asset_url)
+            print(version)
+            print("true" if release.get("prerelease", False) else "false")
+            sys.exit(0)
+
+if requested:
+    print(f"Requested release v{requested} was not found.", file=sys.stderr)
+elif last_error:
+    print(last_error, file=sys.stderr)
+else:
+    print("No downloadable release zip was found.", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+resolve_extract_root() {
+    local extract_dir="$1"
+
+    if [ -f "$extract_dir/plugin.json" ] && [ -d "$extract_dir/dist" ]; then
+        printf '%s\n' "$extract_dir"
+        return 0
+    fi
+
+    if [ -d "$extract_dir/$PLUGIN_SLUG" ] && [ -f "$extract_dir/$PLUGIN_SLUG/plugin.json" ]; then
+        printf '%s\n' "$extract_dir/$PLUGIN_SLUG"
+        return 0
+    fi
+
+    local child
+    while IFS= read -r child; do
+        if [ -f "$child/plugin.json" ] && [ -d "$child/dist" ]; then
+            printf '%s\n' "$child"
+            return 0
+        fi
+    done < <(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    return 1
+}
+
 echo "================================"
 echo "  Xbox Companion Installer"
 echo "  alpha release by neokura"
 echo "================================"
 echo ""
 
-# Check if running on SteamOS/Linux
+require_command "curl" "curl"
+require_command "python3" "Python 3"
+require_command "unzip" "unzip"
+
 if [[ "$OSTYPE" != "linux-gnu"* ]]; then
     echo "Error: This script is intended for Linux/SteamOS only."
     exit 1
 fi
 
-# Check if Decky Loader is installed
 if [ ! -d "$HOME/homebrew/plugins" ]; then
     echo "Decky Loader does not appear to be installed."
     echo ""
@@ -41,7 +138,7 @@ if [ ! -d "$HOME/homebrew/plugins" ]; then
     echo ""
     read -p "Open the Decky website now? (Y/n): " -n 1 -r
     echo ""
-    if [[ -z "$REPLY" || "$REPLY" =~ ^[Yy]$ ]]; then
+    if [[ -z "${REPLY:-}" || "$REPLY" =~ ^[Yy]$ ]]; then
         if command -v xdg-open >/dev/null 2>&1; then
             xdg-open "https://decky.xyz/" >/dev/null 2>&1 || true
         else
@@ -55,14 +152,13 @@ fi
 
 echo "Installing $PLUGIN_NAME..."
 
-# Check if plugin is already installed
 if [ -d "$PLUGIN_DIR" ]; then
     echo ""
     echo "Existing installation detected at: $PLUGIN_DIR"
     echo "This will remove the old installation and reinstall the plugin."
     read -p "Continue? (y/N): " -n 1 -r
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ! "${REPLY:-}" =~ ^[Yy]$ ]]; then
         echo "Installation cancelled."
         exit 0
     fi
@@ -70,31 +166,30 @@ if [ -d "$PLUGIN_DIR" ]; then
     sudo rm -rf "$PLUGIN_DIR"
 fi
 
-# Create plugin directory with sudo
 echo ""
 echo "Creating plugin directory (requires sudo permission)..."
 sudo mkdir -p "$PLUGIN_DIR"
-sudo chown -R $USER:$USER "$PLUGIN_DIR"
+sudo chown -R "$(id -un):$(id -gn)" "$PLUGIN_DIR"
 
-# Try to get latest release
-echo "Checking for latest release..."
-RELEASE_INFO=$(curl -s "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest")
-LATEST_URL=$(echo "$RELEASE_INFO" | grep -o '"browser_download_url": *"[^"]*\.zip"' | head -1 | cut -d '"' -f 4)
+echo "Checking for a downloadable release..."
+mapfile -t RELEASE_METADATA < <(fetch_release_metadata)
+LATEST_URL="${RELEASE_METADATA[0]:-}"
+SELECTED_VERSION="${RELEASE_METADATA[1]:-unknown}"
+IS_PRERELEASE="${RELEASE_METADATA[2]:-false}"
 
 if [ -z "$LATEST_URL" ]; then
     echo ""
-    echo "Error: No prebuilt release found."
+    echo "Error: No downloadable release zip was found."
     echo ""
     echo "Please download a release from:"
     echo "  https://github.com/$REPO_OWNER/$REPO_NAME/releases"
     echo ""
-    echo "Or wait for the developer to publish a prebuilt release."
     exit 1
 fi
 
-# Download release zip
-echo "Found prebuilt release, downloading..."
-TEMP_ZIP=$(mktemp --suffix=.zip)
+echo "Found release v$SELECTED_VERSION$( [ "$IS_PRERELEASE" = "true" ] && printf ' (pre-release)' )."
+echo "Downloading release..."
+TEMP_ZIP="$(mktemp --suffix=.zip)"
 TEMP_FILES+=("$TEMP_ZIP")
 
 if ! curl -L -f "$LATEST_URL" -o "$TEMP_ZIP" 2>/dev/null; then
@@ -104,28 +199,40 @@ if ! curl -L -f "$LATEST_URL" -o "$TEMP_ZIP" 2>/dev/null; then
     exit 1
 fi
 
+TEMP_EXTRACT_DIR="$(mktemp -d)"
+TEMP_FILES+=("$TEMP_EXTRACT_DIR")
+
 echo "Extracting release..."
-if ! unzip -q -o "$TEMP_ZIP" -d "$PLUGIN_DIR"; then
+if ! unzip -q -o "$TEMP_ZIP" -d "$TEMP_EXTRACT_DIR"; then
     echo ""
     echo "Error: Failed to extract release."
     exit 1
 fi
 
-echo "✓ Prebuilt release installed successfully!"
+EXTRACT_ROOT="$(resolve_extract_root "$TEMP_EXTRACT_DIR" || true)"
+if [ -z "$EXTRACT_ROOT" ]; then
+    echo ""
+    echo "Error: Release archive does not contain a valid Decky plugin layout."
+    exit 1
+fi
 
-# Set proper permissions
-chmod -R 755 "$PLUGIN_DIR"
+echo "Installing files..."
+sudo cp -R "$EXTRACT_ROOT"/. "$PLUGIN_DIR"/
 
+find "$PLUGIN_DIR" -type d -exec chmod 755 {} +
+find "$PLUGIN_DIR" -type f -exec chmod 644 {} +
+
+echo "✓ Release installed successfully!"
 echo ""
 echo "================================"
 echo "  Installation Complete!"
 echo "================================"
 echo ""
 echo "Plugin installed to: $PLUGIN_DIR"
+echo "Installed version: $SELECTED_VERSION"
 echo ""
 echo "Restarting Decky Loader..."
 
-# Restart Decky Loader service
 if sudo systemctl restart plugin_loader 2>/dev/null; then
     echo "✓ Decky Loader restarted successfully!"
     echo ""

@@ -1,6 +1,6 @@
 {
   "name": "xbox-companion",
-  "version": "0.1.1",
+  "version": "0.2.0-alpha.0",
   "description": "Alpha Decky Loader plugin for ASUS/Lenovo SteamOS handheld controls",
   "author": "Neokura",
   "license": "MIT",
@@ -9,11 +9,12 @@
     "build": "shx rm -rf dist && rollup -c --silent",
     "watch": "rollup -c -w",
     "typecheck": "tsc --noEmit",
-    "test": "python3 -m unittest"
+    "test": "python3 -m unittest",
+    "release:zip": "./release.sh"
   },
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
-    "@decky/ui": "^4.11.1",
+    "@decky/ui": "^4.11.3",
     "@rollup/plugin-commonjs": "^26.0.3",
     "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-node-resolve": "^15.3.1",

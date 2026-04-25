@@ -8,7 +8,7 @@ Xbox Companion is an alpha Decky Loader plugin for ASUS and Lenovo handhelds run
 
 The goal is simple: install it, open Decky, and see controls that reflect the real state of the handheld. No default profile is applied on first launch, no hidden preset is pushed silently, and unsupported features stay disabled instead of pretending they work.
 
-Current alpha: `0.1.1`
+Current alpha: `0.2.0-alpha.0`
 
 ## What It Does
 
@@ -20,7 +20,7 @@ Current alpha: `0.1.1`
 - Reads battery status, health, charge limit, voltage, current, capacity, and available charge timing.
 - Reads RGB state from compatible LED sysfs paths and applies preset colors.
 - Shows device, BIOS, kernel, CPU, GPU, memory, temperature, GPU clock, and current TDP information.
-- Offers optional AMD-focused system optimizations with visible state and rollback-aware toggles.
+- Offers optional system optimizations as separate end-user controls with visible compatibility and rollback-aware state.
 
 ## Install From SteamOS
 
@@ -40,7 +40,7 @@ https://decky.xyz/
 
 Install Decky first, then rerun the command above.
 
-When Decky is present, the installer downloads the latest GitHub release zip, extracts it to:
+When Decky is present, the installer downloads the newest published GitHub release zip, including alpha pre-releases, and extracts it to:
 
 ```text
 $HOME/homebrew/plugins/Xbox Companion
@@ -72,8 +72,10 @@ Each control has its own compatibility gate. This means one missing interface sh
 | CPU boost | `/sys/devices/system/cpu/cpufreq/boost` | Mirrors the kernel value |
 | SMT | SteamOS Manager DBus, then `/sys/devices/system/cpu/smt/control` | Mirrors whichever supported backend is available |
 | Charge limit | SteamOS Manager DBus | Mirrors current SteamOS charge limit state |
-| RGB | LED `brightness` and `multi_intensity` sysfs files | Mirrors LED brightness and color when exposed |
-| Optimizations | managed system files and services | Shows configured, active, off, unavailable, or reboot-required state |
+| RGB | LED `brightness`, `multi_index`, and `multi_intensity` sysfs files | Mirrors ASUS Ally-style and Lenovo-style multicolor LEDs when exposed |
+| Optimizations | managed system files, services, sysctl, tmpfiles, and GRUB | Shows configured, active, off, unavailable, or reboot-required state per option |
+
+ASUS and Lenovo handhelds are treated as first-class targets. Device detection accepts common ROG Ally and Legion identifiers, battery discovery scans compatible `BAT*` and `CMB*` power-supply entries instead of assuming `BAT0`, and RGB discovery only enables the control when a compatible LED backend is detected. Legion Go S and Legion Go/Go 2 RGB support follows the HID protocol used by HueSync, with sysfs multicolor LEDs kept as a fallback when exposed by the kernel.
 
 ## First Launch Behavior
 
@@ -93,7 +95,32 @@ Xbox Companion avoids direct manual TDP writes and prefers SteamOS-native APIs. 
 /etc/atomic-update.conf.d/xbox-companion.conf
 ```
 
-Optimization toggles report whether they are active, configured, unavailable, or waiting for reboot. AMD-specific optimizations are gated to AMD platforms.
+Runtime rollback state is stored separately at:
+
+```text
+/var/lib/xbox-companion/optimization-state.json
+```
+
+Optimization toggles report whether they are active, configured, unavailable, or waiting for reboot. Each option is separated so users can enable only the controls they actually want:
+
+- `LAVD Scheduler`
+- `Swap Protection`
+- `THP Madvise`
+- `NPU Blacklist`
+- `USB Wake Guard`
+- `AMD P-State`
+- `Disable ABM`
+- `Split Lock Mitigation`
+- `NMI Watchdog`
+- `PCIe ASPM`
+
+Compatibility is checked per option. For example, the NPU blacklist is unavailable unless an AMD NPU is detected, USB wake control requires `/proc/acpi/wakeup`, THP requires the kernel THP interface, and kernel parameter controls require an AMD platform with a writable GRUB configuration.
+
+Kernel parameter options are handled directly through `/etc/default/grub` and the SteamOS atomic manifest. Xbox Companion does not install a background GRUB repair script, does not auto-reboot the device, and reports the difference between configured state and the currently active `/proc/cmdline` state so reboot-required controls stay visible. If a kernel parameter already existed before Xbox Companion enabled it, disabling that option preserves the user's original GRUB setting.
+
+Rollback is explicit. Disabling an optimization removes only Xbox Companion-managed files, refreshes the atomic manifest, and restores remembered runtime values where SteamOS does not automatically do that for us, such as the previous SCX config, sysctl memory tuning, THP mode, and USB wake devices.
+
+The Optimizations view also includes an `Enable Available Optimizations` action. It only enables options that are available on the current SteamOS handheld, skips incompatible controls, and leaves already-enabled controls untouched.
 
 ## Troubleshooting
 
@@ -147,9 +174,10 @@ The workflow:
 - runs TypeScript type checks
 - runs Python unit tests
 - builds the Decky frontend
-- packages a release zip
+- packages a Decky-ready release zip with a top-level `xbox-companion/` directory
 - uploads the zip as a workflow artifact
 - attaches the zip to a GitHub Release when a `v*` tag is pushed
+- marks tagged pre-release versions such as `v0.2.0-alpha.0` as GitHub pre-releases
 
 The release package contains:
 
@@ -164,8 +192,8 @@ The release package contains:
 To publish a tagged alpha:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.2.0-alpha.0
+git push origin v0.2.0-alpha.0
 ```
 
 ## Thanks
