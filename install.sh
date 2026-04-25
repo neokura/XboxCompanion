@@ -218,6 +218,7 @@ fi
 
 echo "Installing files..."
 sudo cp -R "$EXTRACT_ROOT"/. "$PLUGIN_DIR"/
+sudo chown -R "$(id -un):$(id -gn)" "$PLUGIN_DIR"
 
 find "$PLUGIN_DIR" -type d -exec chmod 755 {} +
 find "$PLUGIN_DIR" -type f -exec chmod 644 {} +
