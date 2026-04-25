@@ -105,6 +105,20 @@ FPS_HIGH_REFRESH_MIN = 90
 FPS_OPTION_DISABLED = 0
 RGB_COLOR_PRESETS = ["#FF0000", "#00B7FF", "#00FF85", "#FFFFFF"]
 DEFAULT_COMMAND_TIMEOUT = 5
+SYSTEM_COMMAND_ENV_DROP_KEYS = {
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONNOUSERSITE",
+    "PYINSTALLER_RESET_ENVIRONMENT",
+    "PYINSTALLER_STRICT_UNPACK_MODE",
+    "_MEIPASS2",
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_LINUX_PROCESS_NAME",
+    "_PYI_PARENT_PROCESS_LEVEL",
+}
 
 LEGION_GO_S_HID = {
     "name": "Legion Go S HID RGB",
@@ -214,6 +228,19 @@ GRUB_KERNEL_PARAM_OPTIONS = {
     },
 }
 
+
+def sanitized_system_env(overrides: dict | None = None) -> dict:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in SYSTEM_COMMAND_ENV_DROP_KEYS
+        and not key.startswith("PYI_")
+        and key != "MEIPASS"
+    }
+    if overrides:
+        env.update(overrides)
+    return env
+
 class SteamOsManagerClient:
     """Small DBus client for SteamOS Manager via busctl."""
 
@@ -225,7 +252,8 @@ class SteamOsManagerClient:
             ["busctl", "--system", *args],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
+            env=sanitized_system_env(),
         )
 
     def _get_property(
@@ -471,9 +499,7 @@ class GamescopeSettingsClient:
         return candidates or [":0"]
 
     def _xprop_env(self, display: str) -> dict:
-        env = os.environ.copy()
-        env["DISPLAY"] = display
-        return env
+        return sanitized_system_env({"DISPLAY": display})
 
     def _run_xprop(self, args: list[str], display: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -1146,6 +1172,7 @@ class Plugin:
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_COMMAND_TIMEOUT,
+                env=sanitized_system_env(),
             )
             if result.returncode == 0:
                 info["kernel"] = result.stdout.strip()
@@ -1618,6 +1645,7 @@ class Plugin:
                 capture_output=True,
                 text=True,
                 timeout=20,
+                env=sanitized_system_env(),
             )
         except FileNotFoundError:
             return False, f"{command[0]} is not installed"
@@ -1638,6 +1666,7 @@ class Plugin:
                 capture_output=True,
                 text=True,
                 timeout=20,
+                env=sanitized_system_env(),
             )
         except FileNotFoundError:
             return False, f"{command[0]} is not installed"
@@ -1731,6 +1760,7 @@ class Plugin:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=sanitized_system_env(),
             )
             return result.returncode == 0 and service in result.stdout
         except Exception:
@@ -1743,6 +1773,7 @@ class Plugin:
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_COMMAND_TIMEOUT,
+                env=sanitized_system_env(),
             )
             return result.returncode == 0 and result.stdout.strip() == "enabled"
         except Exception:
@@ -1755,6 +1786,7 @@ class Plugin:
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_COMMAND_TIMEOUT,
+                env=sanitized_system_env(),
             )
             return result.returncode == 0 and result.stdout.strip() == "active"
         except Exception:
@@ -1766,6 +1798,7 @@ class Plugin:
             capture_output=True,
             text=True,
             timeout=DEFAULT_COMMAND_TIMEOUT,
+            env=sanitized_system_env(),
         )
         if result.returncode != 0:
             return ""

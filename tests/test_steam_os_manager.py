@@ -58,6 +58,26 @@ SUPPORTED_PLATFORM = {
 
 
 class SteamOsManagerClientTest(unittest.TestCase):
+    def test_sanitized_system_env_removes_embedded_runtime_library_overrides(self):
+        with patch.dict(
+            "main.os.environ",
+            {
+                "LD_LIBRARY_PATH": "/tmp/_MEI/lib",
+                "PYTHONHOME": "/tmp/_MEI",
+                "_PYI_APPLICATION_HOME_DIR": "/tmp/_MEI",
+                "DISPLAY": ":1",
+                "PATH": "/usr/bin:/bin",
+            },
+            clear=True,
+        ):
+            env = main.sanitized_system_env({"DISPLAY": ":0"})
+
+        self.assertNotIn("LD_LIBRARY_PATH", env)
+        self.assertNotIn("PYTHONHOME", env)
+        self.assertNotIn("_PYI_APPLICATION_HOME_DIR", env)
+        self.assertEqual(env["DISPLAY"], ":0")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+
     def test_reads_native_performance_state(self):
         def fake_run(cmd, **_kwargs):
             prop = cmd[-1]
