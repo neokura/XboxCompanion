@@ -1,60 +1,123 @@
 # Xbox Companion
 
-Xbox Companion is an early alpha Decky Loader plugin for current and future ASUS/Lenovo handhelds running SteamOS 3.8 or newer. It focuses on SteamOS-native controls first, with hardware-specific features enabled only when the running device exposes the required system interfaces.
+[![Build and Package](https://github.com/neokura/XboxCompanion/actions/workflows/release.yml/badge.svg)](https://github.com/neokura/XboxCompanion/actions/workflows/release.yml)
+[![Release](https://img.shields.io/github/v/release/neokura/XboxCompanion?include_prereleases&label=alpha)](https://github.com/neokura/XboxCompanion/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-This repository starts at `0.1.1`.
+Xbox Companion is an alpha Decky Loader plugin for ASUS and Lenovo handhelds running SteamOS 3.8 or newer. It brings the most useful system controls into the Decky quick access menu while staying close to SteamOS-native APIs.
 
-## Status
+The goal is simple: install it, open Decky, and see controls that reflect the real state of the handheld. No default profile is applied on first launch, no hidden preset is pushed silently, and unsupported features stay disabled instead of pretending they work.
 
-Xbox Companion is experimental software for ASUS/Lenovo SteamOS handhelds. It is intended for testing on devices that expose SteamOS Manager, gamescope, and compatible Linux hardware controls.
+Current alpha: `0.1.1`
 
-Use it only if you are comfortable with Decky plugins that run with root permissions. System optimizations are optional and visible in the UI before they are enabled.
+## What It Does
 
-## Supported Platform
+- Uses the three native SteamOS performance profiles: `low-power`, `balanced`, and `performance`.
+- Reads and toggles VRR and V-Sync through gamescope root properties when available.
+- Reads and sets live framerate limits through `gamescopectl`.
+- Reads and toggles CPU boost when the kernel exposes the control.
+- Reads and toggles SMT through SteamOS Manager first, then the kernel SMT interface when needed.
+- Reads battery status, health, charge limit, voltage, current, capacity, and available charge timing.
+- Reads RGB state from compatible LED sysfs paths and applies preset colors.
+- Shows device, BIOS, kernel, CPU, GPU, memory, temperature, GPU clock, and current TDP information.
+- Offers optional AMD-focused system optimizations with visible state and rollback-aware toggles.
 
-Xbox Companion uses the same behavior across supported handheld consoles instead of maintaining per-model support tiers. It is enabled only when runtime checks detect:
+## Install From SteamOS
 
-- SteamOS 3.8 or newer
-- ASUS or Lenovo handheld hardware
-- Non-Steam Deck hardware
-- Required system interfaces for each individual feature
-
-Steam Deck is intentionally blocked to avoid interfering with Valve hardware defaults. Other distributions such as Bazzite and ChimeraOS are also blocked because the system optimizations and SteamOS assumptions are tuned for SteamOS on ASUS/Lenovo handhelds.
-
-## Features
-
-- SteamOS native performance profiles through SteamOS Manager over DBus.
-- SteamOS performance profiles mapped directly to `low-power`, `balanced`, and `performance`.
-- VRR and V-Sync controls through gamescope root properties when available.
-- Live FPS limit control through `gamescopectl` when installed.
-- CPU boost control when the kernel exposes it.
-- Battery diagnostics and charge limit discovery when supported by the device.
-- RGB control for compatible handheld LED sysfs paths.
-- Device, BIOS, kernel, CPU, GPU, memory, temperature, and display diagnostics.
-- Optional system optimizations for scheduler, memory, power, and AMD kernel parameters.
-
-## Requirements
-
-- SteamOS 3.8 or newer.
-- Decky Loader 3.2 or newer.
-- SteamOS Manager DBus service for native performance profile control.
-- `xprop` for gamescope display sync controls.
-- `gamescopectl` for live FPS limit control.
-- Root plugin permission, declared through `_root` in `plugin.json`.
-
-Features are gated at runtime. Unsupported platforms, missing tools, or missing hardware interfaces should result in disabled controls rather than hard failures.
-
-## Install
-
-Open Konsole on SteamOS and run:
+Open Konsole on the handheld and run:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/neokura/XboxCompanion/main/install.sh)
 ```
 
-The installer checks that Decky Loader is installed before touching the plugin directory. If Decky is missing, it offers to open <https://decky.xyz/> so you can install Decky first, then rerun the command.
+The installer checks for Decky Loader before it touches the plugin directory.
 
-The installer downloads the latest GitHub release zip, extracts it to `$HOME/homebrew/plugins/Xbox Companion`, and restarts Decky Loader when possible. The plugin should then appear in the Decky quick access menu.
+If Decky is missing, the installer stops and offers to open:
+
+```text
+https://decky.xyz/
+```
+
+Install Decky first, then rerun the command above.
+
+When Decky is present, the installer downloads the latest GitHub release zip, extracts it to:
+
+```text
+$HOME/homebrew/plugins/Xbox Companion
+```
+
+Then it restarts Decky Loader when possible. Xbox Companion should appear in the Decky quick access menu after the restart.
+
+## Supported Platforms
+
+Xbox Companion intentionally uses runtime checks instead of a hardcoded model whitelist. A handheld is supported only when all of these are true:
+
+- SteamOS 3.8 or newer
+- ASUS or Lenovo handheld hardware
+- Not Steam Deck hardware
+- Required system interfaces exist for the specific feature
+
+Steam Deck is blocked to avoid changing Valve hardware defaults. Bazzite, ChimeraOS, and non-SteamOS distributions are also blocked for now because the system assumptions are tuned for SteamOS on ASUS and Lenovo handhelds.
+
+## Feature Availability
+
+Each control has its own compatibility gate. This means one missing interface should not break the whole plugin.
+
+| Area | Backend used | Frontend behavior |
+| --- | --- | --- |
+| Performance profiles | SteamOS Manager DBus | Shows only native SteamOS modes and marks the active one |
+| VRR | gamescope `GAMESCOPE_VRR_*` atoms through `xprop` | Shows unavailable, incompatible, enabled, disabled, or active |
+| V-Sync | gamescope allow-tearing atom through `xprop` | Shows the current real state and toggles the inverse allow-tearing value |
+| FPS limit | `gamescopectl debug_get_fps_limit` and `debug_set_fps_limit` | Shows live limit when readable, otherwise disables writes that cannot be verified |
+| CPU boost | `/sys/devices/system/cpu/cpufreq/boost` | Mirrors the kernel value |
+| SMT | SteamOS Manager DBus, then `/sys/devices/system/cpu/smt/control` | Mirrors whichever supported backend is available |
+| Charge limit | SteamOS Manager DBus | Mirrors current SteamOS charge limit state |
+| RGB | LED `brightness` and `multi_intensity` sysfs files | Mirrors LED brightness and color when exposed |
+| Optimizations | managed system files and services | Shows configured, active, off, unavailable, or reboot-required state |
+
+## First Launch Behavior
+
+Xbox Companion does not apply a default configuration during installation or first launch.
+
+On startup it reads the handheld state from SteamOS, gamescope, kernel sysfs, DBus, and systemd. The UI should represent the console as it is, not as a local defaults file says it should be.
+
+The plugin may write system state only when you explicitly toggle a control.
+
+## Safety Model
+
+This is a root Decky plugin. Treat it like system software.
+
+Xbox Companion avoids direct manual TDP writes and prefers SteamOS-native APIs. Optional optimizations write managed files under known paths, register them through one consolidated atomic manifest at:
+
+```text
+/etc/atomic-update.conf.d/xbox-companion.conf
+```
+
+Optimization toggles report whether they are active, configured, unavailable, or waiting for reboot. AMD-specific optimizations are gated to AMD platforms.
+
+## Troubleshooting
+
+If the plugin does not appear:
+
+```bash
+sudo systemctl restart plugin_loader
+```
+
+If the installer says Decky is missing, install Decky first:
+
+```text
+https://decky.xyz/
+```
+
+If a specific control is disabled, open the Information view inside Xbox Companion. It shows platform support, available controls, display state, battery state, optimization state, and hardware diagnostics.
+
+Common reasons for disabled controls:
+
+- `gamescopectl` is not installed or cannot read the live FPS limit.
+- gamescope root properties are not exposed on the current display.
+- SteamOS Manager does not expose the expected DBus property.
+- The handheld does not expose the required kernel sysfs path.
+- The device or OS is intentionally blocked by the platform guard.
 
 ## Development
 
@@ -74,11 +137,19 @@ pnpm run build
 
 Build output is written to `dist/`.
 
-## Release
+## Release Pipeline
 
-GitHub Actions runs on pull requests, pushes to `main`, manual dispatches, and version tags. The workflow installs dependencies, runs type checks, runs Python unit tests, builds the frontend, and uploads a downloadable release zip as a workflow artifact.
+GitHub Actions runs on pull requests, pushes to `main`, manual dispatches, and version tags.
 
-When a tag named `v*` is pushed, the same zip is also attached to the GitHub Release.
+The workflow:
+
+- installs dependencies with pnpm
+- runs TypeScript type checks
+- runs Python unit tests
+- builds the Decky frontend
+- packages a release zip
+- uploads the zip as a workflow artifact
+- attaches the zip to a GitHub Release when a `v*` tag is pushed
 
 The release package contains:
 
@@ -90,18 +161,12 @@ The release package contains:
 - `LICENSE`
 - `icons/`
 
-To create a tagged release:
+To publish a tagged alpha:
 
 ```bash
 git tag v0.1.1
 git push origin v0.1.1
 ```
-
-## Safety
-
-Xbox Companion avoids direct manual TDP writes and prefers SteamOS-native APIs. Optional system optimizations write managed files under known paths, register them through one consolidated atomic manifest at `/etc/atomic-update.conf.d/xbox-companion.conf`, and report their active/configured state in the UI.
-
-AMD-specific optimization toggles are gated to AMD platforms. Device-specific controls are discovered dynamically and remain unavailable when the current handheld does not expose the expected Linux interfaces. Steam Deck, Bazzite, ChimeraOS, non-SteamOS environments, and non-ASUS/Lenovo hardware are blocked before system-level controls are exposed.
 
 ## Thanks
 
