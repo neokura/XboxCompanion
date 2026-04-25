@@ -177,6 +177,44 @@ class SteamOsManagerClientTest(unittest.TestCase):
         self.assertTrue(env.get("DBUS_SESSION_BUS_ADDRESS", "").startswith("unix:path="))
         self.assertTrue(env.get("XDG_RUNTIME_DIR", "").startswith("/run/user/"))
 
+    def test_falls_back_to_system_bus_when_interface_is_not_on_user_bus(self):
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            bus = "--user" if "--user" in cmd else "--system"
+            if "introspect" in cmd:
+                if bus == "--user":
+                    return subprocess.CompletedProcess(cmd, 1, "", "unknown object")
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "\n".join(
+                        [
+                            "com.steampowered.SteamOSManager1.PerformanceProfile1 interface - -",
+                            "AvailablePerformanceProfiles property as 3 emits-change",
+                            "PerformanceProfile property s - emits-change",
+                            "SuggestedDefaultPerformanceProfile property s - emits-change",
+                        ]
+                    ),
+                    "",
+                )
+            prop = cmd[-1]
+            if prop == "AvailablePerformanceProfiles":
+                return subprocess.CompletedProcess(cmd, 0, 'as 1 "balanced"\n', "")
+            if prop == "PerformanceProfile":
+                return subprocess.CompletedProcess(cmd, 0, 's "balanced"\n', "")
+            if prop == "SuggestedDefaultPerformanceProfile":
+                return subprocess.CompletedProcess(cmd, 0, 's "balanced"\n', "")
+            return subprocess.CompletedProcess(cmd, 1, "", "unknown property")
+
+        with patch("main.subprocess.run", side_effect=fake_run):
+            client = main.SteamOsManagerClient(FakeLogger())
+            state = client.get_performance_state()
+
+        self.assertTrue(state["available"])
+        self.assertTrue(any("--system" in call for call in calls))
+
     def test_sets_native_performance_profile(self):
         calls = []
 
@@ -2015,6 +2053,18 @@ class OptimizationStateTest(unittest.TestCase):
             result = asyncio.run(plugin.set_optimization_enabled("swap_protect", True))
 
         self.assertFalse(result)
+
+    def test_optimization_toggle_accepts_case_insensitive_keys(self):
+        plugin = main.Plugin()
+
+        with patch.object(plugin, "_get_current_platform_support", return_value=SUPPORTED_PLATFORM), patch.object(
+            plugin, "_set_lavd_enabled", return_value=None
+        ), patch.object(
+            plugin, "_get_lavd_state", return_value={"key": "lavd", "available": True, "enabled": True}
+        ):
+            result = asyncio.run(plugin.set_optimization_enabled("Lavd", True))
+
+        self.assertTrue(result)
 
     def test_optimization_disable_rejects_when_runtime_is_still_active(self):
         plugin = main.Plugin()

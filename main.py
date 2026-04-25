@@ -271,6 +271,7 @@ class SteamOsManagerClient:
     def __init__(self, logger):
         self.logger = logger
         self.user_bus_env = self._build_user_bus_env()
+        self._interface_bus_cache: dict[str, str] = {}
 
     def _build_user_bus_env(self) -> dict:
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
@@ -286,18 +287,22 @@ class SteamOsManagerClient:
             }
         )
 
-    def _run_busctl(self, args: list[str]) -> subprocess.CompletedProcess:
+    def _run_busctl(self, bus: str, args: list[str]) -> subprocess.CompletedProcess:
+        env = self.user_bus_env if bus == "user" else sanitized_system_env()
         return subprocess.run(
-            ["busctl", "--user", *args],
+            ["busctl", f"--{bus}", *args],
             capture_output=True,
             text=True,
             timeout=5,
-            env=self.user_bus_env,
+            env=env,
         )
 
-    def _introspect_interfaces(self) -> dict[str, set[str]]:
+    def _candidate_buses(self) -> list[str]:
+        return ["user", "system"]
+
+    def _introspect_interfaces(self, bus: str) -> dict[str, set[str]]:
         try:
-            result = self._run_busctl([
+            result = self._run_busctl(bus, [
                 "introspect",
                 STEAMOS_MANAGER_SERVICE,
                 STEAMOS_MANAGER_OBJECT,
@@ -325,8 +330,21 @@ class SteamOsManagerClient:
                 interfaces.setdefault(current_interface, set()).add(parts[0])
         return interfaces
 
+    def _find_interface_bus(self, interface: str) -> str:
+        cached = self._interface_bus_cache.get(interface, "")
+        if cached:
+            return cached
+        for bus in self._candidate_buses():
+            if interface in self._introspect_interfaces(bus):
+                self._interface_bus_cache[interface] = bus
+                return bus
+        return ""
+
     def _get_available_properties(self, interface: str) -> set[str]:
-        return self._introspect_interfaces().get(interface, set())
+        bus = self._find_interface_bus(interface)
+        if not bus:
+            return set()
+        return self._introspect_interfaces(bus).get(interface, set())
 
     def _has_property(self, interface: str, prop: str) -> bool:
         return prop in self._get_available_properties(interface)
@@ -336,49 +354,74 @@ class SteamOsManagerClient:
         prop: str,
         interface: str = STEAMOS_PERFORMANCE_INTERFACE,
     ) -> tuple[bool, str, str]:
-        try:
-            result = self._run_busctl([
-                "get-property",
-                STEAMOS_MANAGER_SERVICE,
-                STEAMOS_MANAGER_OBJECT,
-                interface,
-                prop
-            ])
-        except FileNotFoundError:
-            return False, "", "busctl is not installed"
-        except subprocess.TimeoutExpired:
-            return False, "", "SteamOS Manager DBus request timed out"
-        except Exception as e:
-            return False, "", str(e)
+        buses = []
+        preferred_bus = self._find_interface_bus(interface)
+        if preferred_bus:
+            buses.append(preferred_bus)
+        buses.extend(bus for bus in self._candidate_buses() if bus not in buses)
 
-        if result.returncode != 0:
-            error = result.stderr.strip() or result.stdout.strip() or "DBus property read failed"
-            return False, "", error
+        last_error = "DBus property read failed"
+        for bus in buses:
+            try:
+                result = self._run_busctl(bus, [
+                    "get-property",
+                    STEAMOS_MANAGER_SERVICE,
+                    STEAMOS_MANAGER_OBJECT,
+                    interface,
+                    prop
+                ])
+            except FileNotFoundError:
+                return False, "", "busctl is not installed"
+            except subprocess.TimeoutExpired:
+                last_error = "SteamOS Manager DBus request timed out"
+                continue
+            except Exception as e:
+                last_error = str(e)
+                continue
 
-        return True, result.stdout.strip(), ""
+            if result.returncode == 0:
+                self._interface_bus_cache[interface] = bus
+                return True, result.stdout.strip(), ""
+
+            last_error = result.stderr.strip() or result.stdout.strip() or "DBus property read failed"
+
+        return False, "", last_error
 
     def _set_property(self, interface: str, prop: str, signature: str, value: str) -> tuple[bool, str]:
-        try:
-            result = self._run_busctl([
-                "set-property",
-                STEAMOS_MANAGER_SERVICE,
-                STEAMOS_MANAGER_OBJECT,
-                interface,
-                prop,
-                signature,
-                value,
-            ])
-        except FileNotFoundError:
-            return False, "busctl is not installed"
-        except subprocess.TimeoutExpired:
-            return False, "SteamOS Manager DBus request timed out"
-        except Exception as e:
-            return False, str(e)
+        buses = []
+        preferred_bus = self._find_interface_bus(interface)
+        if preferred_bus:
+            buses.append(preferred_bus)
+        buses.extend(bus for bus in self._candidate_buses() if bus not in buses)
 
-        if result.returncode != 0:
-            return False, result.stderr.strip() or result.stdout.strip() or "DBus property write failed"
+        last_error = "DBus property write failed"
+        for bus in buses:
+            try:
+                result = self._run_busctl(bus, [
+                    "set-property",
+                    STEAMOS_MANAGER_SERVICE,
+                    STEAMOS_MANAGER_OBJECT,
+                    interface,
+                    prop,
+                    signature,
+                    value,
+                ])
+            except FileNotFoundError:
+                return False, "busctl is not installed"
+            except subprocess.TimeoutExpired:
+                last_error = "SteamOS Manager DBus request timed out"
+                continue
+            except Exception as e:
+                last_error = str(e)
+                continue
 
-        return True, ""
+            if result.returncode == 0:
+                self._interface_bus_cache[interface] = bus
+                return True, ""
+
+            last_error = result.stderr.strip() or result.stdout.strip() or "DBus property write failed"
+
+        return False, last_error
 
     def _parse_busctl_bool(self, output: str) -> bool:
         tokens = shlex.split(output)
@@ -2938,42 +2981,43 @@ class Plugin:
 
     async def set_optimization_enabled(self, key: str, enabled: bool) -> bool:
         try:
-            self._debug_attempt("optimization", "set_enabled", "Toggling optimization", {"key": key, "enabled": enabled})
+            normalized_key = str(key or "").strip().lower()
+            self._debug_attempt("optimization", "set_enabled", "Toggling optimization", {"key": key, "normalized_key": normalized_key, "enabled": enabled})
             support = self._get_current_platform_support()
             if not support.get("supported", False):
                 decky.logger.warning(support.get("reason", "Platform is not supported"))
-                self._debug_failure("optimization", "set_enabled", support.get("reason", "Platform is not supported"), {"key": key, "enabled": enabled})
+                self._debug_failure("optimization", "set_enabled", support.get("reason", "Platform is not supported"), {"key": key, "normalized_key": normalized_key, "enabled": enabled})
                 return False
 
             handlers = self._optimization_handlers()
             states = self._optimization_state_readers()
 
-            handler = handlers.get(key)
-            state_reader = states.get(key)
+            handler = handlers.get(normalized_key)
+            state_reader = states.get(normalized_key)
             if handler is None or state_reader is None:
                 decky.logger.error(f"Unknown optimization: {key}")
-                self._debug_failure("optimization", "set_enabled", "Unknown optimization", {"key": key, "enabled": enabled})
+                self._debug_failure("optimization", "set_enabled", "Unknown optimization", {"key": key, "normalized_key": normalized_key, "enabled": enabled})
                 return False
 
             before = state_reader()
             if not before.get("available", True):
                 decky.logger.warning(f"Optimization unavailable: {key}")
-                self._debug_failure("optimization", "set_enabled", "Optimization unavailable", {"key": key, "enabled": enabled, "before": before})
+                self._debug_failure("optimization", "set_enabled", "Optimization unavailable", {"key": key, "normalized_key": normalized_key, "enabled": enabled, "before": before})
                 return False
 
             handler(enabled)
             state = state_reader()
             success = state.get("enabled", False) if enabled else not state.get("enabled", False)
             if success:
-                self._debug_success("optimization", "set_enabled", "Optimization updated", {"key": key, "enabled": enabled, "before": before, "after": state})
+                self._debug_success("optimization", "set_enabled", "Optimization updated", {"key": key, "normalized_key": normalized_key, "enabled": enabled, "before": before, "after": state})
             else:
-                self._debug_failure("optimization", "set_enabled", "Optimization state did not change as requested", {"key": key, "enabled": enabled, "before": before, "after": state})
+                self._debug_failure("optimization", "set_enabled", "Optimization state did not change as requested", {"key": key, "normalized_key": normalized_key, "enabled": enabled, "before": before, "after": state})
             if enabled:
                 return success
             return success
         except Exception as e:
             decky.logger.error(f"Failed to toggle optimization {key}: {e}")
-            self._debug_failure("optimization", "set_enabled", f"Failed to toggle optimization: {e}", {"key": key, "enabled": enabled})
+            self._debug_failure("optimization", "set_enabled", f"Failed to toggle optimization: {e}", {"key": key, "normalized_key": str(key or '').strip().lower(), "enabled": enabled})
             return False
 
     async def enable_available_optimizations(self) -> dict:
