@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+py_modules/
+
+# Build output
+# main JS/TS bundles and artifacts
+dist/
+out/
+build/
+.cache/
+*.zip
+
+# TypeScript
+*.tsbuildinfo
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+.env.python
+
+# pnpm
+.pnpm-store/

@@ -1,0 +1,71 @@
+name: Build and Package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Test, Build, and Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Package release zip
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="$(node -p "require('./package.json').version")"
+          fi
+          ZIP_NAME="xbox-companion-v${VERSION}.zip"
+          zip -r "$ZIP_NAME" dist main.py plugin.json package.json LICENSE README.md icons -x "*.DS_Store"
+          mkdir -p release
+          mv "$ZIP_NAME" release/
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xbox-companion-release
+          path: release/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/${{ env.ZIP_NAME }}
+          generate_release_notes: true

@@ -1,0 +1,11 @@
+{
+  "name": "Xbox Companion",
+  "author": "Neokura",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["hardware", "asus", "lenovo", "steamos", "performance", "vrr"],
+    "description": "ASUS/Lenovo SteamOS handheld control center with native performance modes, VRR, VSync, battery, RGB, and diagnostics.",
+    "image": "https://github.com/neokura/XboxCompanion/raw/main/icons/icon.png"
+  }
+}
