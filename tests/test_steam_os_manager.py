@@ -533,6 +533,21 @@ class GamescopeSettingsClientTest(unittest.TestCase):
 
 
 class PluginPerformanceProfileTest(unittest.TestCase):
+    @staticmethod
+    def official_steamos_release(version_id: str) -> dict:
+        return {
+            "ID": "steamos",
+            "NAME": "SteamOS",
+            "PRETTY_NAME": f"SteamOS {version_id.rsplit('.', 1)[0] if version_id.count('.') >= 2 else version_id}",
+            "VERSION_ID": version_id,
+            "VERSION_CODENAME": "holo",
+            "HOME_URL": "https://www.steampowered.com/",
+            "DOCUMENTATION_URL": "https://support.steampowered.com/",
+            "SUPPORT_URL": "https://support.steampowered.com/",
+            "BUG_REPORT_URL": "https://support.steampowered.com/",
+            "LOGO": "steamos",
+        }
+
     def test_device_metadata_uses_uniform_handheld_support(self):
         plugin = main.Plugin()
 
@@ -551,22 +566,14 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "ASUS Handheld",
             "ASUS",
             "",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.8.0",
-                "PRETTY_NAME": "SteamOS 3.8",
-            },
+            self.official_steamos_release("3.8.0"),
         )
         lenovo_future = plugin._get_platform_support(
             "BOARD-B",
             "Lenovo Handheld",
             "LENOVO",
             "Legion",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.9.1",
-                "PRETTY_NAME": "SteamOS 3.9.1",
-            },
+            self.official_steamos_release("3.9.1"),
         )
 
         self.assertTrue(asus["supported"])
@@ -581,11 +588,7 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "83E1",
             "LENOVO",
             "Legion Go",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.8.0",
-                "PRETTY_NAME": "SteamOS 3.8",
-            },
+            self.official_steamos_release("3.8.0"),
         )
 
         self.assertTrue(support["supported"])
@@ -597,11 +600,7 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "ROG Ally",
             "ASUSTeK COMPUTER INC.",
             "",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.8.0",
-                "PRETTY_NAME": "SteamOS 3.8",
-            },
+            self.official_steamos_release("3.8.0"),
         )
 
         self.assertTrue(support["supported"])
@@ -613,18 +612,14 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "Steam Deck",
             "Valve",
             "",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.8.0",
-                "PRETTY_NAME": "SteamOS 3.8",
-            },
+            self.official_steamos_release("3.8.0"),
         )
 
         self.assertFalse(support["supported"])
         self.assertEqual(support["support_level"], "blocked")
         self.assertIn("Steam Deck", support["reason"])
 
-    def test_platform_support_blocks_non_steamos_distributions(self):
+    def test_platform_support_blocks_non_official_steamos_distributions(self):
         plugin = main.Plugin()
 
         bazzite = plugin._get_platform_support(
@@ -641,9 +636,24 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "",
             {"ID": "chimeraos", "VERSION_ID": "48", "PRETTY_NAME": "ChimeraOS"},
         )
+        spoofed = plugin._get_platform_support(
+            "BOARD-A",
+            "Generic Handheld",
+            "ASUS",
+            "",
+            {
+                "ID": "steamos",
+                "NAME": "SteamOS by Bazzite",
+                "PRETTY_NAME": "SteamOS-like Gaming Image",
+                "VERSION_ID": "3.8.0",
+                "ID_LIKE": "fedora",
+            },
+        )
 
         self.assertFalse(bazzite["supported"])
         self.assertFalse(chimera["supported"])
+        self.assertFalse(spoofed["supported"])
+        self.assertIn("official SteamOS builds", spoofed["reason"])
 
     def test_platform_support_blocks_other_steamos_versions(self):
         plugin = main.Plugin()
@@ -652,11 +662,7 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "ASUS Handheld",
             "ASUS",
             "",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.7.0",
-                "PRETTY_NAME": "SteamOS 3.7",
-            },
+            self.official_steamos_release("3.7.0"),
         )
 
         self.assertFalse(support["supported"])
@@ -668,11 +674,7 @@ class PluginPerformanceProfileTest(unittest.TestCase):
             "AMD Gaming Handheld",
             "AYANEO",
             "",
-            {
-                "ID": "steamos",
-                "VERSION_ID": "3.9.0",
-                "PRETTY_NAME": "SteamOS 3.9",
-            },
+            self.official_steamos_release("3.9.0"),
         )
 
         self.assertTrue(support["supported"])

@@ -1,6 +1,9 @@
 """Helpers for SteamOS handheld detection and support gating."""
 
 STEAMOS_MIN_VERSION = (3, 8)
+OFFICIAL_STEAMOS_BRAND = "steamos"
+OFFICIAL_STEAMOS_CODENAME = "holo"
+OFFICIAL_STEAMOS_URL_TOKEN = "steampowered.com"
 ASUS_VENDOR_NAMES = {"ASUS", "ASUSTEK", "ASUSTEK COMPUTER INC."}
 LENOVO_VENDOR_NAMES = {"LENOVO"}
 GENERIC_HANDHELD_VENDOR_NAMES = {
@@ -34,6 +37,10 @@ HANDHELD_IDENTIFIER_KEYWORDS = (
     "XBOX",
     "Z1",
 )
+
+
+def _normalized_os_release_value(values: dict, key: str) -> str:
+    return str(values.get(key, "")).strip().lower()
 
 
 def get_steamos_version(os_release_values: dict | None = None) -> str:
@@ -117,6 +124,31 @@ def steamos_version_is_supported(values: dict) -> bool:
     return False
 
 
+def is_official_steamos_build(values: dict) -> bool:
+    if _normalized_os_release_value(values, "ID") != OFFICIAL_STEAMOS_BRAND:
+        return False
+
+    name_markers = (
+        _normalized_os_release_value(values, "NAME"),
+        _normalized_os_release_value(values, "PRETTY_NAME"),
+    )
+    has_brand_marker = any(OFFICIAL_STEAMOS_BRAND in marker for marker in name_markers)
+    has_logo_marker = _normalized_os_release_value(values, "LOGO") == OFFICIAL_STEAMOS_BRAND
+    has_codename_marker = _normalized_os_release_value(values, "VERSION_CODENAME") == OFFICIAL_STEAMOS_CODENAME
+    has_valve_url_marker = any(
+        OFFICIAL_STEAMOS_URL_TOKEN in _normalized_os_release_value(values, key)
+        for key in ("HOME_URL", "DOCUMENTATION_URL", "SUPPORT_URL", "BUG_REPORT_URL")
+    )
+
+    official_markers = (
+        has_brand_marker,
+        has_logo_marker,
+        has_codename_marker,
+        has_valve_url_marker,
+    )
+    return sum(1 for marker in official_markers if marker) >= 3
+
+
 def get_platform_support(
     board_name: str,
     product_name: str,
@@ -125,11 +157,6 @@ def get_platform_support(
     os_release_values: dict | None = None,
 ) -> dict:
     values = os_release_values or {}
-    os_id = values.get("ID", "").strip().lower()
-    os_name = " ".join(
-        values.get(key, "")
-        for key in ("NAME", "PRETTY_NAME", "ID", "ID_LIKE")
-    ).lower()
 
     if is_steam_deck_device(board_name, product_name, sys_vendor, product_family):
         return {
@@ -138,11 +165,11 @@ def get_platform_support(
             "reason": "Steam Deck is blocked to avoid interfering with Valve hardware defaults.",
         }
 
-    if os_id != "steamos" or any(name in os_name for name in ("bazzite", "chimeraos", "chimera")):
+    if not is_official_steamos_build(values):
         return {
             "supported": False,
             "support_level": "blocked",
-            "reason": "AnyDeck is only enabled on SteamOS 3.8 or newer.",
+            "reason": "AnyDeck is only enabled on official SteamOS builds.",
         }
 
     if not steamos_version_is_supported(values):
