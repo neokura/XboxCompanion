@@ -157,6 +157,25 @@ def open_json(url: str):
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.load(response)
 
+def parse_version(version: str):
+    core, sep, suffix = version.partition("-")
+    try:
+        major_s, minor_s, patch_s = core.split(".")
+        core_parts = (int(major_s), int(minor_s), int(patch_s))
+    except ValueError:
+        return None
+
+    if not sep:
+        return (*core_parts, 1, ())
+
+    suffix_parts = []
+    for part in suffix.split("."):
+        if part.isdigit():
+            suffix_parts.append((0, int(part)))
+        else:
+            suffix_parts.append((1, part))
+    return (*core_parts, 0, tuple(suffix_parts))
+
 last_error = ""
 for url in urls:
     try:
@@ -169,21 +188,36 @@ for url in urls:
         continue
 
     releases = payload if isinstance(payload, list) else [payload]
+    candidates = []
     for release in releases:
         tag_name = str(release.get("tag_name", "") or "")
         if requested and tag_name != f"v{requested}":
+            continue
+
+        version = tag_name[1:] if tag_name.startswith("v") else tag_name
+        parsed_version = parse_version(version)
+        if parsed_version is None:
             continue
 
         for asset in release.get("assets") or []:
             asset_url = str(asset.get("browser_download_url", "") or "")
             if not asset_url.endswith(".zip"):
                 continue
+            candidates.append(
+                (
+                    parsed_version,
+                    version,
+                    asset_url,
+                    "true" if release.get("prerelease", False) else "false",
+                )
+            )
 
-            version = tag_name[1:] if tag_name.startswith("v") else tag_name
-            print(asset_url)
-            print(version)
-            print("true" if release.get("prerelease", False) else "false")
-            sys.exit(0)
+    if candidates:
+        _parsed_version, version, asset_url, prerelease = max(candidates, key=lambda item: item[0])
+        print(asset_url)
+        print(version)
+        print(prerelease)
+        sys.exit(0)
 
 if requested:
     print(f"Requested release v{requested} was not found.", file=sys.stderr)
