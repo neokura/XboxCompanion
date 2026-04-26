@@ -23,6 +23,7 @@ trap cleanup EXIT
 PLUGIN_LOADER_SYSTEMD_DIR="$HOME/homebrew/services/.systemd"
 PLUGIN_LOADER_UNIT="$PLUGIN_LOADER_SYSTEMD_DIR/plugin_loader.service"
 PLUGIN_LOADER_SERVICE_NAMES=()
+PLUGIN_LOADER_REGISTERED_SERVICES=()
 
 discover_plugin_loader_services() {
     local unit_path
@@ -34,6 +35,9 @@ discover_plugin_loader_services() {
         while IFS= read -r unit_path; do
             [ -n "$unit_path" ] || continue
             service_name="$(basename "$unit_path" .service)"
+            if [[ "$service_name" == *"-backup" ]]; then
+                continue
+            fi
             PLUGIN_LOADER_SERVICE_NAMES+=("$service_name")
         done < <(find "$PLUGIN_LOADER_SYSTEMD_DIR" -maxdepth 1 -type f -name 'plugin_loader*.service' | sort)
     fi
@@ -41,6 +45,36 @@ discover_plugin_loader_services() {
     if [ ${#PLUGIN_LOADER_SERVICE_NAMES[@]} -eq 0 ]; then
         PLUGIN_LOADER_SERVICE_NAMES=("plugin_loader")
     fi
+}
+
+filter_known_plugin_loader_services() {
+    local filtered=()
+    local service_name
+    local load_state
+
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        load_state="$(systemctl show "${service_name}.service" -p LoadState --value 2>/dev/null || true)"
+        if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+            continue
+        fi
+        filtered+=("$service_name")
+    done
+
+    if [ ${#filtered[@]} -gt 0 ]; then
+        PLUGIN_LOADER_SERVICE_NAMES=("${filtered[@]}")
+    fi
+}
+
+discover_registered_plugin_loader_services() {
+    local service_name
+
+    PLUGIN_LOADER_REGISTERED_SERVICES=()
+
+    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+        if systemctl list-unit-files "${service_name}.service" --no-legend 2>/dev/null | grep -q "^${service_name}\.service"; then
+            PLUGIN_LOADER_REGISTERED_SERVICES+=("$service_name")
+        fi
+    done
 }
 
 require_command() {
@@ -153,7 +187,12 @@ verify_plugin_loader_effective_user() {
     local effective_user
     local failed=0
 
-    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+    if [ ${#PLUGIN_LOADER_REGISTERED_SERVICES[@]} -eq 0 ]; then
+        echo "⚠ No registered Decky plugin_loader systemd services were found to verify."
+        return 0
+    fi
+
+    for service_name in "${PLUGIN_LOADER_REGISTERED_SERVICES[@]}"; do
         effective_user="$(systemctl show "$service_name" -p User --value 2>/dev/null || true)"
         if [ "$effective_user" = "root" ]; then
             echo "✓ ${service_name} effective user is root"
@@ -174,7 +213,12 @@ verify_plugin_loader_effective_user() {
 restart_plugin_loader_services() {
     local service_name
 
-    for service_name in "${PLUGIN_LOADER_SERVICE_NAMES[@]}"; do
+    if [ ${#PLUGIN_LOADER_REGISTERED_SERVICES[@]} -eq 0 ]; then
+        echo "⚠ No registered Decky plugin_loader systemd services were found to restart."
+        return 1
+    fi
+
+    for service_name in "${PLUGIN_LOADER_REGISTERED_SERVICES[@]}"; do
         echo "Restarting Decky Loader service: ${service_name}"
         sudo systemctl restart "$service_name"
     done
@@ -338,6 +382,8 @@ fi
 
 echo "Installing $PLUGIN_NAME..."
 discover_plugin_loader_services
+filter_known_plugin_loader_services
+discover_registered_plugin_loader_services
 
 if [ -d "$PLUGIN_DIR" ]; then
     echo ""
@@ -426,11 +472,22 @@ echo "Plugin installed to: $PLUGIN_DIR"
 echo "Installed version: $SELECTED_VERSION"
 echo "Decky service units:"
 printf '  - %s\n' "${PLUGIN_LOADER_SERVICE_NAMES[@]}"
+if [ ${#PLUGIN_LOADER_REGISTERED_SERVICES[@]} -gt 0 ]; then
+    echo "Registered systemd services:"
+    printf '  - %s\n' "${PLUGIN_LOADER_REGISTERED_SERVICES[@]}"
+else
+    echo "Registered systemd services:"
+    echo "  - none detected"
+fi
 echo ""
 echo "Restarting Decky Loader..."
 
-restart_plugin_loader_services
-echo "✓ Decky Loader restarted successfully!"
+if restart_plugin_loader_services; then
+    echo "✓ Decky Loader restarted successfully!"
+else
+    echo "⚠ Could not find a registered Decky systemd service to restart automatically."
+    echo "  The plugin files are installed, but you may need to reboot or restart Decky through its own installer/update flow."
+fi
 if ! verify_plugin_loader_effective_user; then
     echo ""
     echo "Error: Decky did not come back with effective root privileges."
