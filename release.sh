@@ -55,7 +55,8 @@ mkdir -p "$PACKAGE_ROOT"
 mkdir -p "$RELEASE_DIR"
 
 cp -R dist "$PACKAGE_ROOT/"
-cp main.py plugin.json package.json LICENSE README.md "$PACKAGE_ROOT/"
+find "$SCRIPT_DIR" -maxdepth 1 -type f -name "*.py" -exec cp {} "$PACKAGE_ROOT/" \;
+cp plugin.json package.json LICENSE README.md "$PACKAGE_ROOT/"
 cp -R icons "$PACKAGE_ROOT/"
 rm -f "$PACKAGE_ROOT"/dist/*.map
 
